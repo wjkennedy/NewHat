@@ -1,0 +1,6 @@
+[submodule "_pyembroidery"]
+	path = _pyembroidery
+	url = git@github.com:wjkennedy/_pyembroidery.git
+[submodule "pystitch"]
+	path = pystitch
+	url = git@github.com:a9group/pystitch.git
