@@ -5,6 +5,8 @@ simulates the resulting machine path, and exports DST files. It is a
 local development prototype intended for review and test stitching, not an
 unattended production digitizer.
 
+![maybe.png](maybe.png)
+
 ![screenshot.png](screenshot.png)
 ## Run the UI
 
