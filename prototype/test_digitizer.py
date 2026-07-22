@@ -7,12 +7,34 @@ import unittest
 
 from PIL import Image, ImageDraw
 
-from digitizer import Operation, _enforce_stitch_criteria, digitize
+from digitizer import Operation, _enforce_stitch_criteria, _satin_rails, digitize
 from server import as_dst, inspect_dst
 from tools.render_stitch_preview import render
 
 
 class DigitizerTest(unittest.TestCase):
+    def test_posterized_satin_rails_smooth_one_pixel_edge_jitter(self):
+        # Alternating one-pixel shifts approximate a diagonal after palette
+        # quantization. The rail smoother should produce an aligned column.
+        component = {
+            (x, y)
+            for y in range(9)
+            for x in range(5 + y % 2, 17 + y % 2)
+        }
+        rails = list(_satin_rails(component, vertical=True, step=1))
+        self.assertEqual(1, len({left[0] for left, _ in rails}))
+        self.assertEqual(1, len({right[0] for _, right in rails}))
+
+    def test_design_center_underlay_precedes_object_underlay(self):
+        image = Image.new("RGBA", (180, 90), (0, 0, 0, 0))
+        ImageDraw.Draw(image).rectangle((15, 20, 165, 70), fill="#153d7a")
+        stream = BytesIO()
+        image.save(stream, format="PNG")
+        plan = digitize(stream.getvalue(), width_mm=72, colors=2)
+        self.assertTrue(plan.foundation_operations)
+        self.assertEqual("design_center_underlay", plan.operations[0].role)
+        self.assertTrue(all(op.region_id == "foundation" for op in plan.foundation_operations))
+
     def test_shared_criteria_splits_oversize_non_tie_stitches(self):
         operations = [
             Operation("jump", 0, 0, "entry", "r"),

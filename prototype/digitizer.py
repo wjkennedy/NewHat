@@ -75,6 +75,7 @@ class StitchPlan:
     regions: list[Region]
     profile: str = "standard"
     machine_max_stitch_mm: float = 7.0
+    foundation_operations: list[Operation] = field(default_factory=list)
 
     def drc(self) -> dict:
         """Report stitch, travel, and density quality measures for the plan.
@@ -147,6 +148,9 @@ class StitchPlan:
         Regions are already routed within their palette group by ``digitize``.
         """
         result: list[Operation] = []
+        # This design-level run is intentionally first: it anchors the fabric
+        # to its backing before object underlay begins to pull in other axes.
+        result.extend(self.foundation_operations)
         first_color = True
         for color in self.palette:
             color_regions = [region for region in self.regions if region.color == color]
@@ -165,6 +169,7 @@ class StitchPlan:
             "dimensions_mm": {"width": self.width_mm, "height": self.height_mm},
             "palette": self.palette,
             "profile": self.profile,
+            "foundation_operations": [asdict(op) for op in self.foundation_operations],
             "regions": [
                 {**asdict(region), "operations": [asdict(op) for op in region.operations]}
                 for region in self.regions
@@ -463,7 +468,7 @@ def _append_routed_fill(
 
 
 def _satin_rails(component: set[tuple[int, int]], *, vertical: bool, step: int) -> Iterable[tuple[tuple[int, int], tuple[int, int]]]:
-    """Derive paired rails from a simple narrow raster region.
+    """Derive smoothed paired rails from a simple narrow raster region.
 
     This is deliberately limited to single-span slices. Branched or holed
     shapes remain fill candidates until a centerline/rail solver is added.
@@ -472,11 +477,28 @@ def _satin_rails(component: set[tuple[int, int]], *, vertical: bool, step: int) 
     for x, y in component:
         key, value = (y, x) if vertical else (x, y)
         grouped.setdefault(key, []).append(value)
+    raw_rails: list[tuple[tuple[int, int], tuple[int, int]]] = []
     for key in sorted(grouped)[::max(1, step)]:
         values = sorted(grouped[key])
         if values[-1] - values[0] < 2 or len(values) != values[-1] - values[0] + 1:
             continue
-        yield ((values[0], key), (values[-1], key)) if vertical else ((key, values[0]), (key, values[-1]))
+        raw_rails.append(
+            ((values[0], key), (values[-1], key))
+            if vertical else ((key, values[0]), (key, values[-1]))
+        )
+    # Posterized artwork often has a one-pixel sawtooth along a diagonal or
+    # curved edge. Locally averaging the two rails removes that quantization
+    # jitter before satin generation while retaining the true local width.
+    for index, (left, right) in enumerate(raw_rails):
+        neighbours = raw_rails[max(0, index - 2):index + 3]
+        if vertical:
+            low = sum(pair[0][0] for pair in neighbours) // len(neighbours)
+            high = sum(pair[1][0] for pair in neighbours) // len(neighbours)
+            yield (low, left[1]), (high, right[1])
+        else:
+            low = sum(pair[0][1] for pair in neighbours) // len(neighbours)
+            high = sum(pair[1][1] for pair in neighbours) // len(neighbours)
+            yield (left[0], low), (right[0], high)
 
 
 def _append_satin(
@@ -514,6 +536,72 @@ def _append_satin(
         for point in pair:
             x, y = _point(point, width, height, width_mm, height_mm)
             ops.append(Operation("stitch", x, y, "satin_top", region_id))
+
+
+def _design_centerline_underlay(
+    mask: set[tuple[int, int]],
+    *,
+    width: int,
+    height: int,
+    width_mm: float,
+    height_mm: float,
+    stitch_length_mm: float = 2.5,
+) -> list[Operation]:
+    """Create a centre-run foundation within the occupied design footprint.
+
+    The run follows the design's dominant axis and is broken at gaps rather
+    than sewing across empty artwork. It is an early stabilizer, not a visible
+    outline: later object underlay and top stitches cover it.
+    """
+    if not mask:
+        return []
+    min_x, max_x = min(x for x, _ in mask), max(x for x, _ in mask)
+    min_y, max_y = min(y for _, y in mask), max(y for _, y in mask)
+    horizontal = (max_x - min_x) * width_mm / width >= (max_y - min_y) * height_mm / height
+    grouped: dict[int, list[int]] = {}
+    for x, y in mask:
+        key, value = (x, y) if horizontal else (y, x)
+        grouped.setdefault(key, []).append(value)
+    global_centre = ((min_y + max_y) / 2) if horizontal else ((min_x + max_x) / 2)
+    paths: list[list[tuple[int, int]]] = []
+    current: list[tuple[int, int]] = []
+    previous_key: int | None = None
+    previous_value: float | None = None
+    for key in sorted(grouped):
+        values = sorted(grouped[key])
+        spans: list[tuple[int, int]] = []
+        start = end = values[0]
+        for value in values[1:] + [None]:
+            if value is None or value != end + 1:
+                spans.append((start, end))
+                if value is not None:
+                    start = value
+            end = value if value is not None else end
+        target = previous_value if previous_value is not None else global_centre
+        low, high = min(spans, key=lambda span: (abs((span[0] + span[1]) / 2 - target), -(span[1] - span[0])))
+        centre = (low + high) / 2
+        point = (key, round(centre)) if horizontal else (round(centre), key)
+        if previous_key is None or key == previous_key + 1:
+            current.append(point)
+        else:
+            if len(current) > 1:
+                paths.append(current)
+            current = [point]
+            previous_value = None
+        previous_key, previous_value = key, centre
+    if len(current) > 1:
+        paths.append(current)
+    pixel_scale = min(width_mm / width, height_mm / height)
+    spacing = max(1, round(stitch_length_mm / pixel_scale))
+    operations: list[Operation] = []
+    for path in paths:
+        _append_run(
+            operations, path, width=width, height=height, width_mm=width_mm,
+            height_mm=height_mm, role="design_center_underlay",
+            region_id="foundation", spacing=spacing,
+        )
+        operations.append(Operation("trim", role="foundation_trim", region_id="foundation"))
+    return operations
 
 
 def _enforce_minimum_stitch(operations: list[Operation], minimum_mm: float = 0.25) -> list[Operation]:
@@ -793,6 +881,14 @@ def digitize(image_bytes: bytes, *, width_mm: float = 72, colors: int = 2, profi
                 maximum_radial_mm=settings.machine_max_stitch_mm,
             )
             regions.append(region)
+    foundation_operations = [] if block_art else _design_centerline_underlay(
+        {(x, y) for (x, y), index in assigned.items() if index in active_colors},
+        width=width, height=height, width_mm=width_mm, height_mm=height_mm,
+    )
+    foundation_operations = _enforce_stitch_criteria(
+        _enforce_minimum_stitch(foundation_operations, settings.running_min_mm),
+        maximum_radial_mm=settings.machine_max_stitch_mm,
+    )
     palette_hex = [_hex(palette[index]) for index in active_colors]
     routed_regions: list[Region] = []
     for color in palette_hex:
@@ -800,5 +896,8 @@ def digitize(image_bytes: bytes, *, width_mm: float = 72, colors: int = 2, profi
             [region for region in regions if region.color == color],
             center_outward=settings.center_outward_routing,
         ))
-    plan = StitchPlan("1.3", width_mm, height_mm, palette_hex, routed_regions, settings.name, settings.machine_max_stitch_mm)
+    plan = StitchPlan(
+        "1.4", width_mm, height_mm, palette_hex, routed_regions,
+        settings.name, settings.machine_max_stitch_mm, foundation_operations,
+    )
     return plan

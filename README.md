@@ -24,6 +24,9 @@ The UI supports:
 - Importing PNG, JPEG, WebP, or SVG artwork.
 - Changing width, palette size, rotation, mirroring, and left/centre/right
   placement on the cap preview.
+- Editing a generated layer's display/thread colour and disabling any colour
+  layer before previewing or exporting. Disabled layers are omitted from the
+  generated DST sequence.
 - Inspecting an existing DST file with the stitch simulator.
 - Playing, stepping through, or expanding the stitch simulation.
 - Adjusting displayed needle colours and names.
@@ -135,7 +138,8 @@ operations = plan.operations
 The final criteria pass removes accidental short stitches and subdivides long
 non-tie stitches according to the selected profile. It also chooses running,
 satin, or fill treatment based on feature size, applies stitch-type-appropriate
-underlay, and routes same-colour objects to reduce travel.
+underlay, adds a design-level centre-run foundation before object underlay, and
+routes same-colour objects to reduce travel.
 
 ## Verification
 
