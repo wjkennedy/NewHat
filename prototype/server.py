@@ -74,7 +74,12 @@ class Handler(SimpleHTTPRequestHandler):
                 request = json.loads(body)
                 encoded = request["image"].split(",", 1)[1]
                 from digitizer import digitize
-                plan = digitize(base64.b64decode(encoded), width_mm=float(request["width_mm"]), colors=int(request["colors"]))
+                plan = digitize(
+                    base64.b64decode(encoded),
+                    width_mm=float(request["width_mm"]),
+                    colors=int(request["colors"]),
+                    profile=str(request.get("profile", "standard")),
+                )
                 payload = json.dumps(plan.json()).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
