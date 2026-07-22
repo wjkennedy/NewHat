@@ -5,6 +5,7 @@ simulates the resulting machine path, and exports DST files. It is a
 local development prototype intended for review and test stitching, not an
 unattended production digitizer.
 
+![screenshot.png](screenshot.png)
 ## Run the UI
 
 The UI and API are served together from the `prototype` directory:
