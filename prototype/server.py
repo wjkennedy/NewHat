@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import sys
+import base64
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
@@ -17,6 +18,8 @@ def as_dst(operations: list[dict]) -> bytes:
     """Compile the browser's richer operation list through the local DST codec."""
     from pystitch import EmbPattern, write_dst
 
+    if not any(operation.get("kind") == "stitch" for operation in operations):
+        raise ValueError("A DST requires at least one stitch operation")
     pattern = EmbPattern()
     pattern.metadata("name", "New Hat Prototype")
     for operation in operations:
@@ -59,13 +62,28 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
-        if path not in {"/api/export.dst", "/api/preview.dst", "/api/inspect.dst"}:
+        if path not in {"/api/export.dst", "/api/preview.dst", "/api/inspect.dst", "/api/digitize"}:
             self.send_error(404)
             return
         try:
             length = int(self.headers.get("Content-Length", "0"))
             body = self.rfile.read(length)
-            dst = body if path == "/api/inspect.dst" else as_dst(json.loads(body)["operations"])
+            if path == "/api/inspect.dst":
+                dst = body
+            elif path == "/api/digitize":
+                request = json.loads(body)
+                encoded = request["image"].split(",", 1)[1]
+                from digitizer import digitize
+                plan = digitize(base64.b64decode(encoded), width_mm=float(request["width_mm"]), colors=int(request["colors"]))
+                payload = json.dumps(plan.json()).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+            else:
+                dst = as_dst(json.loads(body)["operations"])
         except Exception as error:
             self.send_error(400, f"Could not compile stitch plan: {error}")
             return
