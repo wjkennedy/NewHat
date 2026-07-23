@@ -19,6 +19,9 @@ python3 server.py
 
 Open [http://127.0.0.1:8000](http://127.0.0.1:8000) in a browser.
 
+The root page is the basic workspace. The full editable vector workflow is on
+[http://127.0.0.1:8000/digitizer.html](http://127.0.0.1:8000/digitizer.html).
+
 The UI supports:
 
 - Importing PNG, JPEG, WebP, or SVG artwork.
@@ -103,6 +106,41 @@ Available profiles:
 The server compiles the sequence to DST, immediately decodes it, and returns
 the decoded operations for a true-format preview. Coordinates are millimetres.
 Operation kinds are `stitch`, `jump`, `trim`, and `color`.
+
+### Plan editable vector objects
+
+`POST /api/vector/plan`
+
+Send an editable document with millimetre-coordinate Bézier nodes. Each object
+has an `id`, `color`, `stitch_type` (`running`, `satin`, or `tatami`), `closed`
+state, and `nodes`. A node contains an anchor (`x`, `y`) plus optional relative
+`in_x`, `in_y`, `out_x`, and `out_y` control-handle coordinates.
+
+```json
+{
+  "width_mm": 72,
+  "height_mm": 55,
+  "objects": [{
+    "id": "letter-a",
+    "color": "#153d7a",
+    "stitch_type": "satin",
+    "closed": true,
+    "nodes": [{"x": -8, "y": -4}, {"x": 8, "y": -4}, {"x": 8, "y": 4}]
+  }]
+}
+```
+
+The response returns the normalized editable document and its regenerated,
+ordered stitch operations. This is the integration point for the vector editor:
+editing a point or changing a stitch type does not destructively alter the
+underlying curves.
+
+### Vectorize a posterized element
+
+`POST /api/vectorize` accepts a background-removed `data:` image and optional
+`width_mm`. It uses alpha as the foreground mask, not palette colours: touching
+posterized colours are one element with one perimeter. Long narrow elements are
+created as satin objects; broad or irregular elements become tatami objects.
 
 ### Export DST
 

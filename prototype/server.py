@@ -62,7 +62,7 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
-        if path not in {"/api/export.dst", "/api/preview.dst", "/api/inspect.dst", "/api/digitize"}:
+        if path not in {"/api/export.dst", "/api/preview.dst", "/api/inspect.dst", "/api/digitize", "/api/vector/plan", "/api/vectorize"}:
             self.send_error(404)
             return
         try:
@@ -81,6 +81,31 @@ class Handler(SimpleHTTPRequestHandler):
                     profile=str(request.get("profile", "standard")),
                 )
                 payload = json.dumps(plan.json()).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+            elif path == "/api/vector/plan":
+                from vector_document import VectorDocument, stitch_operations
+                document = VectorDocument.from_json(json.loads(body))
+                payload = json.dumps({"document": document.json(), "operations": stitch_operations(document),
+                                      "composition": document.composition()}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+            elif path == "/api/vectorize":
+                request = json.loads(body)
+                from vectorize import vectorize_posterized
+                document = vectorize_posterized(
+                    base64.b64decode(request["image"].split(",", 1)[1]),
+                    width_mm=float(request.get("width_mm", 72)),
+                )
+                payload = json.dumps({"document": document.json(), "composition": document.composition()}).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(payload)))
