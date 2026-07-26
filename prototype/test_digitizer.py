@@ -1,18 +1,352 @@
 from io import BytesIO
+import base64
+import json
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
 import unittest
+import zipfile
 
 from PIL import Image, ImageDraw
 
-from digitizer import Operation, _enforce_stitch_criteria, digitize
-from server import as_dst, inspect_dst
+from digitizer import (
+    Operation,
+    _enforce_stitch_criteria,
+    _satin_rails,
+    digitize,
+    digitize_payload,
+)
+from server import (
+    ARTIFACTS_ROOT,
+    BRACKET_ARTIFACTS,
+    Handler,
+    as_dst,
+    create_training_session,
+    delete_training_session,
+    export_training_session,
+    inspect_dst,
+    save_training_experiment,
+    save_training_feedback,
+)
 from tools.render_stitch_preview import render
 
 
 class DigitizerTest(unittest.TestCase):
+    def test_training_workspace_is_linked_and_omits_machine_chrome(self):
+        prototype_root = Path(__file__).resolve().parent
+        workspace = (prototype_root / "index.html").read_text()
+        training = (prototype_root / "train.html").read_text().lower()
+        self.assertIn('id="trainModel"', workspace)
+        self.assertIn("train model", workspace.lower())
+        self.assertIn("source art", training)
+        self.assertIn("pipeline experiments", training)
+        self.assertIn("posterized art", training)
+        self.assertIn("bracketed sewouts", training)
+        self.assertIn("training signal", training)
+        self.assertNotIn("job preflight", training)
+        self.assertNotIn("needle bar", training)
+
+    def test_training_feedback_persists_validated_pairwise_signal(self):
+        payload = {
+            "schema_version": 1,
+            "training_session_id": "session-123",
+            "source": {
+                "name": "script-mark.png",
+                "sha256": "a" * 64,
+            },
+            "context": {
+                "origin": "advanced",
+                "width_mm": 110,
+                "colors": 2,
+            },
+            "comparison": {
+                "phase": "construction",
+                "parameter": "satin_spacing_mm",
+                "reference": "0.40–0.44 mm",
+                "candidates": [
+                    {
+                        "candidate_id": "satin_spacing_mm-0.36",
+                        "value": 0.36,
+                        "metrics": {"stitches": 2200, "status": "warning"},
+                    },
+                    {
+                        "candidate_id": "satin_spacing_mm-0.42",
+                        "value": 0.42,
+                        "metrics": {"stitches": 1900, "status": "pass"},
+                    },
+                    {
+                        "candidate_id": "satin_spacing_mm-0.5",
+                        "value": 0.5,
+                        "metrics": {"stitches": 1650, "status": "warning"},
+                    },
+                ],
+            },
+            "reinforcement": {
+                "positive_candidate_id": "satin_spacing_mm-0.42",
+                "negative_candidate_ids": ["satin_spacing_mm-0.5"],
+                "reasons": ["negative_space", "curve_flow", "color_accuracy"],
+                "color_accuracy": "accurate",
+                "note": "The counter remains open.",
+            },
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            saved = save_training_feedback(payload, Path(temporary))
+            record_path = Path(saved["record"])
+            self.assertTrue(record_path.exists())
+            record = json.loads(record_path.read_text())
+            self.assertEqual(
+                "satin_spacing_mm-0.42",
+                record["reinforcement"]["positive_candidate_id"],
+            )
+            self.assertEqual(
+                ["color_accuracy", "curve_flow", "negative_space"],
+                record["reinforcement"]["reasons"],
+            )
+            self.assertEqual(
+                "accurate",
+                record["reinforcement"]["color_accuracy"],
+            )
+            self.assertEqual(
+                "construction",
+                record["learning_target"]["phase"],
+            )
+            self.assertEqual(
+                "session-123",
+                record["training_session_id"],
+            )
+            self.assertEqual(1, len(record["preference_pairs"]))
+
+    def test_training_session_exports_artifacts_then_clears_temp_storage(self):
+        image = Image.new("RGBA", (8, 6), (255, 255, 255, 255))
+        stream = BytesIO()
+        image.save(stream, format="PNG")
+        data_url = (
+            "data:image/png;base64,"
+            + base64.b64encode(stream.getvalue()).decode()
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            session = create_training_session({
+                "schema_version": 1,
+                "source": {"name": "white-mark.png", "data_url": data_url},
+                "settings": {"width_mm": 72, "colors": 2},
+                "origin": "basic",
+            }, output)
+            session_id = session["session_id"]
+            saved = save_training_experiment({
+                "schema_version": 1,
+                "session_id": session_id,
+                "experiment": {
+                    "phase": "construction",
+                    "parameter": "tatami_density",
+                    "reference": "0.60–1.50×",
+                    "candidates": [{
+                        "candidate_id": "tatami_density-1.0",
+                        "value": "1.0",
+                        "parameters": {"density_multiplier": 1.0},
+                        "metrics": {"stitches": 2},
+                        "posterized_data_url": data_url,
+                        "sewout_data_url": data_url,
+                        "plan": {
+                            "operations": [
+                                {"kind": "stitch", "x": 0, "y": 0},
+                                {"kind": "stitch", "x": 1, "y": 0},
+                            ],
+                        },
+                    }],
+                },
+            }, output)
+            self.assertEqual(1, saved["experiment_count"])
+            archive, filename = export_training_session(session_id, output)
+            self.assertTrue(filename.endswith(".zip"))
+            self.assertFalse((output / session_id).exists())
+            with zipfile.ZipFile(BytesIO(archive)) as bundle:
+                names = set(bundle.namelist())
+            self.assertIn("session.json", names)
+            self.assertIn(
+                "experiments/tatami_density/"
+                "tatami_density-1.0/candidate.dst",
+                names,
+            )
+            self.assertIn(
+                "experiments/tatami_density/"
+                "tatami_density-1.0/sewout.png",
+                names,
+            )
+            self.assertFalse(delete_training_session(session_id, output))
+
+    def test_training_feedback_rejects_candidate_outside_comparison(self):
+        with self.assertRaisesRegex(ValueError, "positive candidate"):
+            save_training_feedback({
+                "schema_version": 1,
+                "source": {"name": "mark.png", "sha256": "b" * 64},
+                "comparison": {
+                    "phase": "construction",
+                    "parameter": "density_multiplier",
+                    "candidates": [
+                        {"candidate_id": "density_multiplier-0.8"},
+                        {"candidate_id": "density_multiplier-1.0"},
+                    ],
+                },
+                "reinforcement": {
+                    "positive_candidate_id": "density_multiplier-1.2",
+                    "negative_candidate_ids": [],
+                    "reasons": ["coverage"],
+                    "color_accuracy": "acceptable",
+                },
+            }, Path("/tmp/not-written-training-feedback"))
+
+    def test_bracket_gallery_route_is_scoped_to_generated_artifacts(self):
+        handler = Handler.__new__(Handler)
+        self.assertEqual(
+            (BRACKET_ARTIFACTS / "index.html").resolve(),
+            Path(handler.translate_path(
+                "/artifacts/bracket-fixtures/index.html"
+            )).resolve(),
+        )
+        escaped = Path(handler.translate_path(
+            "/artifacts/bracket-fixtures/../../README.md"
+        )).resolve()
+        self.assertEqual(
+            (ARTIFACTS_ROOT / "__not_found__").resolve(),
+            escaped,
+        )
+
+    def test_white_thread_survives_transparent_background_planning(self):
+        image = Image.new("RGBA", (100, 45), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((5, 5, 42, 39), fill=(252, 252, 248, 255))
+        draw.rectangle((58, 5, 95, 39), fill=(30, 72, 126, 255))
+        stream = BytesIO()
+        image.save(stream, format="PNG")
+        plan = digitize(
+            stream.getvalue(),
+            width_mm=72,
+            colors=2,
+            include_posterized=True,
+        )
+        white_regions = [
+            region for region in plan.regions
+            if all(
+                int(region.color[offset:offset + 2], 16) >= 235
+                for offset in (1, 3, 5)
+            )
+        ]
+        self.assertTrue(white_regions)
+        self.assertTrue(any(
+            operation.kind == "stitch"
+            for region in white_regions
+            for operation in region.operations
+        ))
+
+    def test_single_plan_has_three_layers_and_adjustable_density(self):
+        image = Image.new("RGBA", (220, 120), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((10, 20, 100, 26), fill="#153d7a")
+        draw.ellipse((115, 15, 205, 105), fill="#d22d54")
+        draw.rectangle((145, 45, 175, 75), fill=(0, 0, 0, 0))
+        draw.rectangle((10, 70, 18, 78), fill="#d22d54")
+        draw.rectangle((30, 70, 38, 78), fill="#d22d54")
+        stream = BytesIO()
+        image.save(stream, format="PNG")
+
+        low = digitize(
+            stream.getvalue(), width_mm=72, colors=3,
+            density_multiplier=0.7,
+        )
+        high = digitize(
+            stream.getvalue(), width_mm=72, colors=3,
+            density_multiplier=1.3,
+        )
+        self.assertEqual(
+            ["underlay", "blocking", "detail"],
+            [layer["id"] for layer in high.json()["layers"]],
+        )
+        self.assertTrue(high.operations)
+        self.assertEqual(0, high.posterization["dropped_objects_for_movement_budget"])
+        self.assertEqual(
+            low.posterization["source_geometry_elements"],
+            high.posterization["source_geometry_elements"],
+        )
+        self.assertGreater(high.drc()["stitch_count"], low.drc()["stitch_count"])
+        underlay_positions = [
+            index for index, operation in enumerate(high.operations)
+            if "underlay" in operation.role
+        ]
+        blocking_positions = [
+            index for index, operation in enumerate(high.operations)
+            if operation.role in {"top_fill", "satin_top"}
+        ]
+        detail_positions = [
+            index for index, operation in enumerate(high.operations)
+            if operation.role == "top_detail_running"
+        ]
+        self.assertTrue(underlay_positions)
+        self.assertTrue(blocking_positions)
+        self.assertLess(max(underlay_positions), min(blocking_positions))
+        if detail_positions:
+            self.assertLess(max(blocking_positions), min(detail_positions))
+        else:
+            detail_layer = next(
+                layer for layer in high.layer_summary()
+                if layer["id"] == "detail"
+            )
+            self.assertEqual(0, detail_layer["stitch_count"])
+        self.assertIn("pass_filter_sets", high.posterization)
+        self.assertTrue(high.posterization["element_filter_analysis"])
+        for analysis in high.posterization["element_filter_analysis"]:
+            self.assertEqual(
+                {"underlay", "blocking", "detail"},
+                set(analysis["passes"]),
+            )
+
+    def test_running_detail_uses_centerline_instead_of_double_outline(self):
+        image = Image.new("RGBA", (200, 60), (0, 0, 0, 0))
+        ImageDraw.Draw(image).rectangle((10, 28, 190, 29), fill="#153d7a")
+        stream = BytesIO()
+        image.save(stream, format="PNG")
+
+        plan = digitize(stream.getvalue(), width_mm=72, colors=2)
+        region = next(region for region in plan.regions if region.pass_index == 2)
+        self.assertEqual("running", region.stitch_type)
+        running = [
+            operation for operation in region.operations
+            if operation.role in {"detail_running", "top_detail_running"}
+            and operation.kind == "stitch"
+        ]
+        self.assertLess(len(running), 90)
+        self.assertLess(
+            max(operation.y for operation in running)
+            - min(operation.y for operation in running),
+            0.5,
+        )
+
+    def test_posterized_satin_rails_smooth_one_pixel_edge_jitter(self):
+        # Alternating one-pixel shifts approximate a diagonal after palette
+        # quantization. The rail smoother should produce an aligned column.
+        component = {
+            (x, y)
+            for y in range(9)
+            for x in range(5 + y % 2, 17 + y % 2)
+        }
+        rails = list(_satin_rails(component, vertical=True, step=1))
+        self.assertEqual(1, len({left[0] for left, _ in rails}))
+        self.assertEqual(1, len({right[0] for _, right in rails}))
+
+    def test_design_center_underlay_precedes_object_underlay(self):
+        image = Image.new("RGBA", (180, 90), (0, 0, 0, 0))
+        ImageDraw.Draw(image).rectangle((15, 20, 165, 70), fill="#153d7a")
+        stream = BytesIO()
+        image.save(stream, format="PNG")
+        plan = digitize(stream.getvalue(), width_mm=72, colors=2)
+        self.assertTrue(plan.foundation_operations)
+        self.assertEqual("design_center_underlay", plan.operations[0].role)
+        self.assertTrue(any(
+            op.role == "silhouette_tatami_underlay"
+            for op in plan.foundation_operations
+        ))
+
     def test_shared_criteria_splits_oversize_non_tie_stitches(self):
         operations = [
             Operation("jump", 0, 0, "entry", "r"),
@@ -65,8 +399,10 @@ class DigitizerTest(unittest.TestCase):
         plan = digitize(stream.getvalue(), width_mm=72, colors=2)
         roles = {operation.role for operation in plan.operations}
 
-        self.assertEqual(2, len(plan.regions))
-        self.assertTrue({"tie_in", "edge_underlay", "fill_underlay", "top_fill", "tie_off", "trim"} <= roles)
+        interior = [region for region in plan.regions if region.pass_name == "interior"]
+        self.assertEqual(2, len(interior))
+        self.assertTrue({"tie_in", "edge_underlay", "top_fill", "tie_off", "trim"} <= roles)
+        self.assertIn("silhouette_tatami_underlay", roles)
         decoded = inspect_dst(as_dst([operation.__dict__ for operation in plan.operations]))
         self.assertTrue(any(operation["kind"] == "color" for operation in decoded))
 
@@ -82,8 +418,16 @@ class DigitizerTest(unittest.TestCase):
 
         plan = digitize(stream.getvalue(), width_mm=72, colors=2)
         red = "#d22d54"
-        self.assertEqual(2, len([region for region in plan.regions if region.color == red]))
-        self.assertEqual(1, len([operation for operation in plan.operations if operation.kind == "color"]))
+        self.assertEqual(2, len([
+            region for region in plan.regions
+            if region.color == red and region.pass_name == "interior"
+        ]))
+        # Each physical pass may revisit the palette, but disconnected objects
+        # within one color/layer never create a change by themselves.
+        self.assertLessEqual(
+            len([operation for operation in plan.operations if operation.kind == "color"]),
+            len(plan.palette) * 3 - 1,
+        )
         self.assertLess(
             plan.operations.index(next(operation for operation in plan.operations if operation.kind == "color")),
             len(plan.operations) - 1,
@@ -98,10 +442,11 @@ class DigitizerTest(unittest.TestCase):
         image.save(stream, format="PNG")
 
         plan = digitize(stream.getvalue(), width_mm=72, colors=2)
-        self.assertEqual(1, len(plan.regions))
-        self.assertEqual(2, len(plan.regions[0].contours))
+        interior = [region for region in plan.regions if region.pass_name == "interior"]
+        self.assertEqual(1, len(interior))
+        self.assertEqual(2, len(interior[0].contours))
         # Contours are semantic geometry and are preserved in the JSON plan.
-        self.assertEqual(2, len(plan.json()["regions"][0]["contours"]))
+        self.assertEqual(2, len(interior[0].contours))
 
     def test_fill_uses_rotated_physical_stitch_rows(self):
         image = Image.new("RGBA", (160, 90), (0, 0, 0, 0))
@@ -134,7 +479,7 @@ class DigitizerTest(unittest.TestCase):
         image = Image.new("RGBA", (180, 100), (0, 0, 0, 0))
         draw = ImageDraw.Draw(image)
         draw.rectangle((15, 20, 155, 29), fill="#153d7a")  # about 4 mm wide: satin
-        draw.rectangle((15, 55, 155, 57), fill="#d22d54")  # about 1 mm wide: detail running
+        draw.rectangle((15, 55, 155, 56), fill="#d22d54")  # about 1 mm wide: detail running
         stream = BytesIO()
         image.save(stream, format="PNG")
 
@@ -142,7 +487,103 @@ class DigitizerTest(unittest.TestCase):
         types = {region.stitch_type for region in plan.regions}
         roles = {operation.role for operation in plan.operations}
         self.assertTrue({"satin", "running"} <= types)
-        self.assertTrue({"satin_top", "satin_center_underlay", "detail_running"} <= roles)
+        self.assertTrue({"satin_top", "satin_center_underlay", "top_detail_running"} <= roles)
+        satin = next(region for region in plan.regions if region.stitch_type == "satin")
+        running = next(
+            region for region in plan.regions if region.stitch_type == "running"
+        )
+        self.assertTrue(satin.stitch_diagnostics["satin"]["valid"])
+        self.assertGreater(satin.stitch_diagnostics["satin"]["pair_count"], 2)
+        self.assertFalse(any(
+            region.pass_index == 1 and region.element_id == running.element_id
+            for region in plan.regions
+        ))
+        self.assertTrue(
+            running.stitch_diagnostics["pass_filters"]["blocking"]
+            ["replaced_by_running_detail"]
+        )
+
+    def test_construction_brackets_emit_distinct_stitch_families(self):
+        image = Image.new("RGBA", (220, 80), (0, 0, 0, 0))
+        ImageDraw.Draw(image).rounded_rectangle(
+            (10, 34, 210, 44), radius=5, fill="#b81438"
+        )
+        stream = BytesIO()
+        image.save(stream, format="PNG")
+
+        automatic = digitize_payload(
+            stream.getvalue(),
+            width_mm=90,
+            colors=4,
+            construction_mode="auto",
+            include_posterized=True,
+        )
+        tatami = digitize_payload(
+            stream.getvalue(),
+            width_mm=90,
+            colors=4,
+            construction_mode="tatami",
+            include_posterized=True,
+        )
+        multi_run = digitize_payload(
+            stream.getvalue(),
+            width_mm=90,
+            colors=4,
+            construction_mode="multi_run",
+            running_passes=3,
+            include_posterized=True,
+        )
+
+        self.assertTrue(
+            automatic["posterization"]["preview_data_url"].startswith(
+                "data:image/png;base64,"
+            )
+        )
+        self.assertIn(
+            "fill",
+            {region["stitch_type"] for region in tatami["regions"]},
+        )
+        self.assertIn(
+            "top_multi_running",
+            {operation["role"] for operation in multi_run["operations"]},
+        )
+        signatures = {
+            tuple(
+                (operation["kind"], operation.get("role"))
+                for operation in payload["operations"]
+            )
+            for payload in (automatic, tatami, multi_run)
+        }
+        self.assertEqual(3, len(signatures))
+
+    def test_plan_reports_density_and_budget_without_erasing_geometry(self):
+        image = Image.new("RGBA", (240, 120), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        for index in range(12):
+            x = 5 + index * 19
+            draw.rectangle((x, 35, x + 12, 47), fill="#153d7a")
+        stream = BytesIO()
+        image.save(stream, format="PNG")
+
+        plan = digitize(
+            stream.getvalue(), width_mm=72, colors=2,
+            limits={"max_objects": 8, "max_trims": 20, "max_jumps": 140},
+        )
+        report = plan.drc()
+        interior = [
+            region for region in plan.regions if region.pass_name == "interior"
+        ]
+        self.assertEqual(12, len(interior))
+        self.assertGreater(report["stitches_per_sq_in"], 0)
+        self.assertEqual(8, report["planning_limits"]["max_objects"])
+        self.assertGreater(report["budget_violations"]["objects"], 0)
+        self.assertFalse(report["budget_pass"])
+        self.assertEqual(0, plan.posterization["dropped_objects_for_movement_budget"])
+        self.assertIn("interior", report["composition_passes"])
+        self.assertTrue(any(
+            operation.role == "silhouette_tatami_underlay"
+            for operation in plan.foundation_operations
+        ))
 
     def test_a9qr_posterization_preserves_square_binary_art(self):
         image_bytes = (Path(__file__).resolve().parent.parent / "a9qr.png").read_bytes()
@@ -181,6 +622,74 @@ class DigitizerTest(unittest.TestCase):
         plan = digitize(stream.getvalue(), width_mm=72, colors=2)
         self.assertIn("#d22d54", plan.palette)
         self.assertTrue(any(region.color == "#d22d54" for region in plan.regions))
+
+    def test_opaque_script_art_is_sized_from_foreground_not_white_canvas(self):
+        image = Path(__file__).resolve().parent.parent / "bobevans.jpg"
+        plan = digitize(image.read_bytes(), width_mm=110, colors=8)
+        self.assertAlmostEqual(110.0, plan.width_mm)
+        self.assertAlmostEqual(21.5, plan.height_mm, delta=0.2)
+        self.assertEqual(1, len(plan.palette))
+        self.assertFalse(any(
+            operation.kind == "color" for operation in plan.operations
+        ))
+        self.assertEqual(
+            1, plan.posterization["semantic_color_count"]
+        )
+        self.assertTrue(
+            plan.posterization["stroke_vector_candidate"]
+        )
+        self.assertTrue(plan.posterization["cropped_to_foreground"])
+        self.assertEqual(
+            {"width": 500, "height": 500},
+            plan.posterization["source_size_px"],
+        )
+
+    def test_auto_payload_selects_one_color_satin_rail_plan(self):
+        image = Path(__file__).resolve().parent.parent / "bobevans.jpg"
+        payload = digitize_payload(
+            image.read_bytes(), width_mm=110, colors=8
+        )
+        self.assertEqual(1, len(payload["palette"]))
+        red = payload["palette"][0].lstrip("#")
+        red, green, blue = (
+            int(red[index:index + 2], 16) for index in (0, 2, 4)
+        )
+        self.assertGreater(red, green * 4)
+        self.assertGreater(red, blue * 2)
+        self.assertEqual(
+            "stroke_vector",
+            payload["posterization"]["selected_planner"],
+        )
+        satin = [
+            region for region in payload["regions"]
+            if region["stitch_type"] == "satin"
+        ]
+        self.assertGreaterEqual(len(satin), 20)
+        self.assertTrue(all(
+            len(region["satin_rails"]) == 2 for region in satin
+        ))
+        self.assertTrue(payload["brackets"])
+        self.assertEqual(
+            "new-hat-drc/1.0",
+            payload["drc_policy"]["policy_version"],
+        )
+        self.assertIn(
+            payload["drc_policy"]["status"],
+            {"pass", "review", "block"},
+        )
+        self.assertTrue(all(
+            bracket["object_id"] in {
+                region["id"] for region in satin
+            }
+            for bracket in payload["brackets"]
+        ))
+        self.assertEqual(
+            0,
+            sum(
+                operation["kind"] == "color"
+                for operation in payload["operations"]
+            ),
+        )
 
 
 if __name__ == "__main__":
