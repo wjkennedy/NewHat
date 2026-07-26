@@ -115,6 +115,15 @@ class DrcTrainingTests(unittest.TestCase):
             9,
         )
 
+        color_loss = payload()
+        color_loss["posterization"]["foreground_color_coverage"] = 0.72
+        evaluation = evaluate_drc(color_loss)
+        self.assertEqual(evaluation["status"], "block")
+        self.assertTrue(any(
+            finding["rule"] == "artwork.foreground_color_loss"
+            for finding in evaluation["hard_blockers"]
+        ))
+
     def test_training_records_are_group_split_and_rights_gated(self):
         first = deterministic_split("same-design-family")
         self.assertEqual(first, deterministic_split("same-design-family"))

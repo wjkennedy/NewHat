@@ -228,6 +228,7 @@ def build_training_record(
                 key: payload.get("posterization", {}).get(key)
                 for key in (
                     "method", "source_size_px", "foreground_pixels",
+                    "foreground_color_coverage",
                     "source_geometry_elements", "semantic_color_count",
                     "stroke_vector_candidate", "selected_planner",
                     "color_separation", "construction_mode",

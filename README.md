@@ -162,11 +162,14 @@ each element's area, estimated width, bounding dimensions, aspect ratio,
 geometric edge count, color complexity/entropy, image-edge count/density, pass
 eligibility, filter names, and output pixel counts.
 
-Foreground extraction is independent of thread color. Transparent images use
-an Otsu threshold over alpha. Opaque images use Otsu luminance thresholding and
-the border class as background. Palette reduction then assigns thread colors
-only inside that foreground. Geometry elements keep stable IDs when they are
-subdivided into color layers.
+Foreground extraction is independent of requested thread colors. Transparent
+images use an Otsu threshold over alpha. Opaque multicolor images sample the
+border and remove only background-similar pixels, preserving bright authored
+white, cream, yellow, and light-blue elements. One-hue marks use a tighter
+Otsu silhouette to suppress JPEG fringe. Accent-preserving palette reduction
+is used for multicolor work; median-cut shades remain available for one-hue
+consolidation. Geometry elements keep stable IDs when they are subdivided into
+color layers.
 
 Available profiles:
 

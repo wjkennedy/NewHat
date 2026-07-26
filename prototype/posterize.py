@@ -85,35 +85,155 @@ def otsu_foreground_mask(source: Image.Image) -> tuple[set[tuple[int, int]], dic
             "foreground_pixels": len(mask),
         }
 
-    gray = rgba.convert("L")
-    values = list(_pixels(gray))
-    gray_pixels = gray.load()
-    if min(values) == max(values):
+    rgb = rgba.convert("RGB")
+    rgb_pixels = rgb.load()
+    values = list(_pixels(rgb))
+    if len(set(values)) == 1:
         mask = {(x, y) for y in range(height) for x in range(width)}
         return mask, {
             "method": "uniform_opaque",
-            "threshold": values[0],
+            "background_reference_rgb": list(values[0]),
             "foreground_pixels": len(mask),
+            "foreground_color_coverage": 1.0,
         }
-    threshold = otsu_threshold(values)
-    border = (
+    border_points = (
         [(x, y) for x in range(width) for y in (0, height - 1)]
         + [(x, y) for y in range(1, height - 1) for x in (0, width - 1)]
     )
-    border_light = sum(gray_pixels[x, y] > threshold for x, y in border)
-    light_background = border_light >= len(border) / 2
+    border_colors = [rgb_pixels[x, y] for x, y in border_points]
+    ordered_channels = [
+        sorted(color[channel] for color in border_colors)
+        for channel in range(3)
+    ]
+    middle = len(border_colors) // 2
+    background_reference = tuple(
+        channel[middle] for channel in ordered_channels
+    )
+
+    def background_distance(point: tuple[int, int]) -> float:
+        color = rgb_pixels[point[0], point[1]]
+        return sqrt(sum(
+            (color[channel] - background_reference[channel]) ** 2
+            for channel in range(3)
+        ))
+
+    border_distances = sorted(
+        background_distance(point) for point in border_points
+    )
+    robust_index = min(
+        len(border_distances) - 1,
+        round((len(border_distances) - 1) * 0.98),
+    )
+    tolerance = max(18.0, min(36.0, border_distances[robust_index] + 4.0))
+    background_like = {
+        (x, y)
+        for y in range(height)
+        for x in range(width)
+        if background_distance((x, y)) <= tolerance
+    }
+    border_background = {
+        point for point in border_points if point in background_like
+    }
+    connected_background = set(border_background)
+    queue = list(border_background)
+    while queue:
+        x, y = queue.pop()
+        for neighbor in (
+            (x - 1, y), (x + 1, y),
+            (x, y - 1), (x, y + 1),
+        ):
+            if (
+                neighbor in background_like
+                and neighbor not in connected_background
+            ):
+                connected_background.add(neighbor)
+                queue.append(neighbor)
+
+    # Background-colored counters remain negative space. Authored white or
+    # cream objects survive when their source color differs materially from
+    # the sampled canvas, even though both are visually light.
+    background_like_holes = background_like - connected_background
+    background = connected_background | background_like_holes
     mask = {
         (x, y)
         for y in range(height)
         for x in range(width)
-        if (gray_pixels[x, y] <= threshold) == light_background
+        if (x, y) not in background
     }
+    hue_families = _significant_hue_families([
+        rgb_pixels[x, y] for x, y in mask
+    ])
+    if hue_families == 1:
+        # A one-hue mark benefits from the tighter Otsu silhouette: pale JPEG
+        # fringe is still the same eventual thread family and should not
+        # become dozens of disconnected geometry objects.
+        gray = rgba.convert("L")
+        gray_values = list(_pixels(gray))
+        gray_pixels = gray.load()
+        threshold = otsu_threshold(gray_values)
+        border_light = sum(
+            gray_pixels[x, y] > threshold for x, y in border_points
+        )
+        light_background = border_light >= len(border_points) / 2
+        mask = {
+            (x, y)
+            for y in range(height)
+            for x in range(width)
+            if (gray_pixels[x, y] <= threshold) == light_background
+        }
+        return mask, {
+            "method": "otsu_luminance_single_hue",
+            "threshold": threshold,
+            "background_class": "light" if light_background else "dark",
+            "background_reference_rgb": list(background_reference),
+            "significant_hue_families": hue_families,
+            "foreground_pixels": len(mask),
+            "foreground_color_coverage": 1.0,
+        }
     return mask, {
-        "method": "otsu_luminance",
-        "threshold": threshold,
-        "background_class": "light" if light_background else "dark",
+        "method": "border_connected_color_distance",
+        "background_reference_rgb": list(background_reference),
+        "background_tolerance_rgb": tolerance,
+        "border_connected_background_pixels": len(connected_background),
+        "background_like_negative_space_pixels": len(background_like_holes),
+        "significant_hue_families": hue_families,
         "foreground_pixels": len(mask),
+        "foreground_color_coverage": 1.0,
     }
+
+
+def _significant_hue_families(
+    colors: list[tuple[int, int, int]],
+    *,
+    bins: int = 18,
+) -> int:
+    """Count materially populated chromatic hue groups."""
+    if not colors:
+        return 0
+    step = max(1, len(colors) // 50_000)
+    counts = Counter()
+    sampled = 0
+    for red, green, blue in colors[::step]:
+        hue, saturation, value = rgb_to_hsv(
+            red / 255, green / 255, blue / 255
+        )
+        if saturation < 0.25 or value < 0.10:
+            continue
+        counts[int(hue * bins) % bins] += 1
+        sampled += 1
+    threshold = max(12, round(sampled * 0.003))
+    occupied = sorted(
+        index for index, count in counts.items() if count >= threshold
+    )
+    if not occupied:
+        return 0
+    groups = 1 + sum(
+        right - left > 1
+        for left, right in zip(occupied, occupied[1:])
+    )
+    if occupied[0] == 0 and occupied[-1] == bins - 1 and groups > 1:
+        groups -= 1
+    return groups
 
 
 def quantize_foreground(
@@ -132,10 +252,25 @@ def quantize_foreground(
     rgb_pixels = rgb.load()
     ordered_points = sorted(foreground, key=lambda point: (point[1], point[0]))
     sample = Image.new("RGB", (len(ordered_points), 1))
-    sample.putdata([rgb_pixels[x, y] for x, y in ordered_points])
+    source_colors = [rgb_pixels[x, y] for x, y in ordered_points]
+    sample.putdata(source_colors)
+    hue_families = _significant_hue_families(source_colors)
+    quantizer = (
+        Image.Quantize.FASTOCTREE
+        if hue_families >= 2
+        else Image.Quantize.MEDIANCUT
+    )
+    quantizer_name = (
+        "fast_octree_accent_preserving"
+        if quantizer == Image.Quantize.FASTOCTREE
+        else "median_cut_single_hue"
+    )
     quantized = sample.quantize(
         colors=max(1, min(int(colors), len(ordered_points))),
-        method=Image.Quantize.MEDIANCUT,
+        # Fast octree retains small, perceptually distinct accents in
+        # multicolor artwork. Median cut remains more economical for
+        # antialiased one-hue marks, where its shades consolidate cleanly.
+        method=quantizer,
     )
     palette_data = quantized.getpalette()
     data = list(
@@ -206,6 +341,8 @@ def quantize_foreground(
         ]
         diagnostics.update({
             "quantized_color_count": len(selected),
+            "quantizer": quantizer_name,
+            "significant_hue_families": hue_families,
             "semantic_color_count": len(representatives),
             "merged_shade_count": len(selected) - len(representatives),
             "merge_tolerance_rgb": merge_tolerance,
@@ -268,6 +405,17 @@ def _same_thread_family(
             hue_distance <= 0.04
             and abs(left_s - right_s) <= 0.38
             and abs(left_v - right_v) <= 0.28
+        )
+    if (
+        max(left_s, right_s) >= 0.20
+        and min(left_s, right_s) >= 0.08
+    ):
+        # JPEG antialiasing commonly creates a pale tint of the authored
+        # thread hue. Treat that tint as the same family while still keeping
+        # true achromatic white/cream independent.
+        return (
+            hue_distance <= 0.04
+            and abs(left_v - right_v) <= 0.70
         )
     return (
         max(left_s, right_s) <= 0.18

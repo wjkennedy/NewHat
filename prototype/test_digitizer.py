@@ -670,7 +670,7 @@ class DigitizerTest(unittest.TestCase):
         ))
         self.assertTrue(payload["brackets"])
         self.assertEqual(
-            "new-hat-drc/1.0",
+            "new-hat-drc/1.1",
             payload["drc_policy"]["policy_version"],
         )
         self.assertIn(
