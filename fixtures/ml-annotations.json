@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "defaults": {
+    "training_use": "unspecified",
+    "review_status": "unreviewed",
+    "license": "unspecified"
+  },
+  "sources": {
+    "<source-sha256>": {
+      "training_use": "allowed",
+      "license": "<license-or-internal-rights-record>",
+      "review_status": "approved",
+      "reviewer": "<reviewer-id>",
+      "expert_plan_approved": true,
+      "human_acceptance": "accepted",
+      "split_group": "<design-family-id>",
+      "corrections_ref": "<structured-edit-log.json>",
+      "physical_sewout": {
+        "status": "accepted",
+        "article_profile": "structured_cap",
+        "sample_ref": "<sewout-record-id>"
+      }
+    }
+  }
+}

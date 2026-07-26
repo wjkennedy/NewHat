@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Model training — bracket review</title>
+    <link rel="stylesheet" href="train.css" />
+  </head>
+  <body>
+    <header class="training-header">
+      <a class="wordmark" id="backLink" href="index.html">DIGITIZING LAB <span>/ MODEL TRAINING</span></a>
+      <div class="header-actions">
+        <input id="artworkFile" type="file" accept="image/png,image/jpeg,image/webp,image/svg+xml" hidden />
+        <button class="quiet" id="replaceArtwork">Replace artwork</button>
+        <a class="quiet" id="returnLink" href="index.html">Return to digitizer</a>
+      </div>
+    </header>
+
+    <main class="training-shell">
+      <section class="intro">
+        <div>
+          <p class="eyebrow">REINFORCEMENT REVIEW</p>
+          <h1>Teach the stitch planner.</h1>
+        </div>
+        <p class="lede">Compare one controlled parameter at a time. Choose the sewout that best preserves the artwork, then mark the evidence that explains your decision.</p>
+      </section>
+
+      <section class="source-and-controls">
+        <article class="source-card">
+          <div class="section-heading">
+            <div><p class="eyebrow">SOURCE ART</p><h2 id="sourceName">Waiting for artwork</h2></div>
+            <span class="source-size" id="sourceSize">—</span>
+          </div>
+          <div class="source-frame">
+            <img id="sourceArtwork" alt="Artwork used to generate the training candidates" />
+            <div class="empty-source" id="emptySource">
+              <b>No artwork in this handoff</b>
+              <span>Replace artwork to begin a bracket review.</span>
+            </div>
+          </div>
+        </article>
+
+        <aside class="parameter-card">
+          <p class="eyebrow">PIPELINE EXPERIMENTS</p>
+          <div class="parameter-list" id="parameterList" role="tablist" aria-label="Training parameters"></div>
+          <div class="parameter-reference">
+            <span>REFERENCE</span>
+            <b id="referenceRange">—</b>
+            <p id="referenceCopy">The bracket keeps every other planner input fixed.</p>
+          </div>
+        </aside>
+      </section>
+
+      <section class="review">
+        <div class="review-heading">
+          <div><p class="eyebrow">BRACKETED SEWOUTS</p><h2 id="bracketTitle">Controlled comparison</h2></div>
+          <span id="bracketSummary">Preparing candidates…</span>
+        </div>
+        <div class="candidate-grid" id="candidates" aria-live="polite"></div>
+      </section>
+
+      <section class="training-signal">
+        <div class="signal-copy">
+          <p class="eyebrow">TRAINING SIGNAL</p>
+          <h2 id="selectionSummary">Choose one positive candidate</h2>
+          <p>Mark the qualities that should be reinforced. Negative candidates are optional but improve pairwise learning.</p>
+        </div>
+        <div class="signal-form">
+          <fieldset>
+            <legend>Why is it better?</legend>
+            <div class="reason-list" id="reasonList">
+              <button type="button" data-reason="negative_space">Negative space</button>
+              <button type="button" data-reason="curve_flow">Curve flow</button>
+              <button type="button" data-reason="edge_quality">Clean edges</button>
+              <button type="button" data-reason="coverage">Coverage</button>
+              <button type="button" data-reason="color_accuracy">Color accuracy</button>
+              <button type="button" data-reason="thread_economy">Thread economy</button>
+              <button type="button" data-reason="pathing">Pathing</button>
+            </div>
+          </fieldset>
+          <fieldset>
+            <legend>Color accuracy</legend>
+            <div class="accuracy-list" id="colorAccuracy" aria-label="Color accuracy classification">
+              <button type="button" data-accuracy="accurate">Accurate</button>
+              <button type="button" data-accuracy="acceptable">Acceptable</button>
+              <button type="button" data-accuracy="shifted">Shifted</button>
+              <button type="button" data-accuracy="incorrect">Incorrect</button>
+            </div>
+          </fieldset>
+          <label class="note-label" for="reviewNote">Reviewer note <span>Optional</span></label>
+          <textarea id="reviewNote" rows="2" placeholder="What should the planner learn from this comparison?"></textarea>
+          <button class="commit" id="saveSignal" disabled>Save training signal</button>
+          <p class="save-status" id="saveStatus" role="status"></p>
+        </div>
+      </section>
+    </main>
+
+    <template id="candidateTemplate">
+      <article class="candidate">
+        <div class="candidate-topline">
+          <span class="candidate-letter"></span>
+          <span class="candidate-kind"></span>
+        </div>
+        <div class="candidate-visuals">
+          <div class="posterized-frame"><span>POSTERIZED ART</span><img alt="Posterized color separation for this candidate" /></div>
+          <div class="sewout-frame"><span class="visual-label">FINAL SEWOUT</span><canvas width="720" height="440"></canvas><div class="render-busy"><i></i><span>Planning sewout</span></div></div>
+        </div>
+        <div class="candidate-palette"></div>
+        <div class="candidate-parameter"><span></span><b></b></div>
+        <div class="candidate-metrics"></div>
+        <div class="candidate-evidence"></div>
+        <div class="candidate-actions">
+          <button type="button" class="positive">Use as positive</button>
+          <button type="button" class="negative">Mark negative</button>
+        </div>
+      </article>
+    </template>
+
+    <script src="train.js"></script>
+  </body>
+</html>

@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "defaults": {
+    "width_mm": 110,
+    "colors": 8,
+    "profile": "standard",
+    "density_multiplier": 1.0
+  },
+  "fixtures": [
+    {
+      "name": "bob-evans-script",
+      "path": "bobevans.jpg",
+      "width_mm": 110,
+      "colors": 8,
+      "profile": "structured_cap"
+    },
+    {
+      "name": "qr-block-art",
+      "path": "a9qr.png",
+      "width_mm": 72,
+      "colors": 2
+    },
+    {
+      "name": "clownfish-transparent",
+      "path": "clown.png",
+      "width_mm": 95,
+      "colors": 6
+    },
+    {
+      "name": "maybe-multicolor",
+      "path": "maybe.png",
+      "width_mm": 110,
+      "colors": 8
+    },
+    {
+      "name": "satin-curves-svg",
+      "path": "fixtures/bracket-artwork/satin-curves.svg",
+      "width_mm": 110,
+      "colors": 4,
+      "profile": "structured_cap"
+    }
+  ]
+}

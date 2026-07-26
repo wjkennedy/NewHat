@@ -1,0 +1,24 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+
+# Generated reports, previews, and transient queue data.
+/artifacts/
+/tmp/
+
+# Local reverse-engineering and indexed-corpus workspaces.
+/RE/
+/corpus-index/
+/corpus-pdf-index/
+
+# Local capture and exported-machine samples.
+/*.mov
+/*.dst
+/*.DST
+
+# Local research notes that are not product documentation.
+/backstory.md
+/esp9K.txt
+
+# Local duplicate retained during guide review.
+/docs/world-class-programmatic-embroidery-digitizing-guide(1).md
