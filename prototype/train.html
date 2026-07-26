@@ -12,6 +12,8 @@
       <div class="header-actions">
         <input id="artworkFile" type="file" accept="image/png,image/jpeg,image/webp,image/svg+xml" hidden />
         <button class="quiet" id="replaceArtwork">Replace artwork</button>
+        <button class="quiet" id="exportSession" disabled>Export session</button>
+        <button class="quiet danger" id="discardSession" disabled>Discard session</button>
         <a class="quiet" id="returnLink" href="index.html">Return to digitizer</a>
       </div>
     </header>
@@ -42,6 +44,7 @@
 
         <aside class="parameter-card">
           <p class="eyebrow">PIPELINE EXPERIMENTS</p>
+          <p class="session-progress" id="sessionProgress">No experiments cached</p>
           <div class="parameter-list" id="parameterList" role="tablist" aria-label="Training parameters"></div>
           <div class="parameter-reference">
             <span>REFERENCE</span>

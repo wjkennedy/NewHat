@@ -6,6 +6,9 @@ import io
 import json
 import sys
 import base64
+import re
+import shutil
+import zipfile
 from datetime import datetime, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
@@ -16,6 +19,7 @@ ROOT = Path(__file__).resolve().parent
 ARTIFACTS_ROOT = ROOT.parent / "artifacts"
 BRACKET_ARTIFACTS = ARTIFACTS_ROOT / "bracket-fixtures"
 TRAINING_FEEDBACK_ROOT = ARTIFACTS_ROOT / "training-feedback"
+TRAINING_SESSION_ROOT = ARTIFACTS_ROOT / "training-sessions-tmp"
 sys.path.insert(0, str(ROOT.parent / "pystitch" / "src"))
 
 TRAINING_PARAMETERS = {
@@ -45,6 +49,199 @@ TRAINING_COLOR_ACCURACY = {
     "shifted",
     "incorrect",
 }
+SAFE_IDENTIFIER = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$")
+
+
+def _write_json(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid4().hex[:8]}.tmp")
+    temporary.write_text(json.dumps(value, indent=2) + "\n")
+    temporary.replace(path)
+
+
+def _decode_data_url(value: str) -> tuple[str, bytes]:
+    if not isinstance(value, str) or not value.startswith("data:"):
+        raise ValueError("Artifact must be a data URL")
+    header, encoded = value.split(",", 1)
+    if ";base64" not in header:
+        raise ValueError("Artifact data URL must be base64 encoded")
+    mime = header[5:].split(";", 1)[0].lower()
+    extensions = {
+        "image/png": ".png",
+        "image/jpeg": ".jpg",
+        "image/webp": ".webp",
+        "image/svg+xml": ".svg",
+    }
+    try:
+        content = base64.b64decode(encoded, validate=True)
+    except ValueError as error:
+        raise ValueError("Artifact data URL is invalid") from error
+    return extensions.get(mime, ".bin"), content
+
+
+def _session_path(session_id: str, output: Path) -> Path:
+    if not SAFE_IDENTIFIER.fullmatch(str(session_id)):
+        raise ValueError("Training session identifier is invalid")
+    return output / str(session_id)
+
+
+def create_training_session(
+    payload: dict, output: Path = TRAINING_SESSION_ROOT
+) -> dict:
+    """Create a temporary, exportable experiment session."""
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        raise ValueError("Unsupported training-session schema")
+    source = payload.get("source")
+    settings = payload.get("settings")
+    if not isinstance(source, dict) or not isinstance(settings, dict):
+        raise ValueError("Training-session source and settings are required")
+    extension, source_bytes = _decode_data_url(source.get("data_url", ""))
+    created_at = datetime.now(timezone.utc)
+    session_id = f"{created_at:%Y%m%dT%H%M%SZ}-{uuid4().hex[:12]}"
+    root = _session_path(session_id, output)
+    root.mkdir(parents=True, exist_ok=False)
+    source_name = Path(str(source.get("name", "source-art"))).name
+    source_path = root / f"source{extension}"
+    source_path.write_bytes(source_bytes)
+    manifest = {
+        "schema_version": 1,
+        "session_id": session_id,
+        "created_at": created_at.isoformat(),
+        "source": {
+            "name": source_name,
+            "artifact": source_path.name,
+        },
+        "settings": settings,
+        "origin": payload.get("origin"),
+        "experiments": {},
+    }
+    _write_json(root / "session.json", manifest)
+    return {
+        "session_id": session_id,
+        "created_at": manifest["created_at"],
+    }
+
+
+def save_training_experiment(
+    payload: dict, output: Path = TRAINING_SESSION_ROOT
+) -> dict:
+    """Persist plans, renders, DST files, and parameters for one phase."""
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        raise ValueError("Unsupported training-experiment schema")
+    session_id = str(payload.get("session_id", ""))
+    root = _session_path(session_id, output)
+    manifest_path = root / "session.json"
+    if not manifest_path.exists():
+        raise ValueError("Training session was not found or was already cleared")
+    experiment = payload.get("experiment")
+    if not isinstance(experiment, dict):
+        raise ValueError("Training experiment is required")
+    parameter = str(experiment.get("parameter", ""))
+    if parameter not in TRAINING_PARAMETERS:
+        raise ValueError("Training parameter is not supported")
+    phase = str(experiment.get("phase", ""))
+    if phase not in TRAINING_PHASES:
+        raise ValueError("Training phase is not supported")
+    candidates = experiment.get("candidates")
+    if not isinstance(candidates, list) or not 1 <= len(candidates) <= 7:
+        raise ValueError("A training experiment requires one to seven candidates")
+
+    experiment_root = root / "experiments" / parameter
+    if experiment_root.exists():
+        shutil.rmtree(experiment_root)
+    experiment_root.mkdir(parents=True)
+    candidate_summaries = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            raise ValueError("Training candidate must be an object")
+        candidate_id = str(candidate.get("candidate_id", ""))
+        if not SAFE_IDENTIFIER.fullmatch(candidate_id):
+            raise ValueError("Training candidate identifier is invalid")
+        plan = candidate.get("plan")
+        if not isinstance(plan, dict):
+            raise ValueError("Training candidate plan is required")
+        candidate_root = experiment_root / candidate_id
+        candidate_root.mkdir()
+        _write_json(candidate_root / "parameters.json", {
+            "candidate_id": candidate_id,
+            "value": candidate.get("value"),
+            "parameters": candidate.get("parameters", {}),
+            "metrics": candidate.get("metrics", {}),
+        })
+        _write_json(candidate_root / "plan.json", plan)
+        operations = plan.get("operations", [])
+        dst_name = None
+        if any(
+            operation.get("kind") == "stitch"
+            for operation in operations
+            if isinstance(operation, dict)
+        ):
+            dst_name = "candidate.dst"
+            (candidate_root / dst_name).write_bytes(as_dst(operations))
+        for field, filename in (
+            ("posterized_data_url", "posterized.png"),
+            ("sewout_data_url", "sewout.png"),
+        ):
+            value = candidate.get(field)
+            if value:
+                _, content = _decode_data_url(value)
+                (candidate_root / filename).write_bytes(content)
+        candidate_summaries.append({
+            "candidate_id": candidate_id,
+            "value": candidate.get("value"),
+            "directory": str(
+                candidate_root.relative_to(root)
+            ),
+            "dst": dst_name,
+        })
+    review = experiment.get("review")
+    experiment_manifest = {
+        "phase": phase,
+        "parameter": parameter,
+        "reference": experiment.get("reference"),
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+        "candidates": candidate_summaries,
+        "review": review if isinstance(review, dict) else None,
+    }
+    _write_json(experiment_root / "experiment.json", experiment_manifest)
+    manifest = json.loads(manifest_path.read_text())
+    manifest["experiments"][parameter] = experiment_manifest
+    _write_json(manifest_path, manifest)
+    return {
+        "session_id": session_id,
+        "parameter": parameter,
+        "candidate_count": len(candidate_summaries),
+        "experiment_count": len(manifest["experiments"]),
+    }
+
+
+def export_training_session(
+    session_id: str, output: Path = TRAINING_SESSION_ROOT
+) -> tuple[bytes, str]:
+    """Build an in-memory archive, then delete the temporary session."""
+    root = _session_path(session_id, output)
+    if not (root / "session.json").exists():
+        raise ValueError("Training session was not found or was already cleared")
+    archive = io.BytesIO()
+    with zipfile.ZipFile(
+        archive, "w", compression=zipfile.ZIP_DEFLATED
+    ) as bundle:
+        for path in sorted(root.rglob("*")):
+            if path.is_file():
+                bundle.write(path, path.relative_to(root))
+    shutil.rmtree(root)
+    return archive.getvalue(), f"training-session-{session_id}.zip"
+
+
+def delete_training_session(
+    session_id: str, output: Path = TRAINING_SESSION_ROOT
+) -> bool:
+    """Delete temporary sewouts and plans for an abandoned session."""
+    root = _session_path(session_id, output)
+    if not root.exists():
+        return False
+    shutil.rmtree(root)
+    return True
 
 
 def save_training_feedback(
@@ -235,16 +432,78 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
-        if path not in {"/api/export.dst", "/api/preview.dst", "/api/inspect.dst", "/api/digitize", "/api/vector/plan", "/api/vectorize", "/api/training/feedback"}:
+        if path not in {
+            "/api/export.dst",
+            "/api/preview.dst",
+            "/api/inspect.dst",
+            "/api/digitize",
+            "/api/vector/plan",
+            "/api/vectorize",
+            "/api/training/feedback",
+            "/api/training/session/create",
+            "/api/training/session/experiment",
+            "/api/training/session/export",
+            "/api/training/session/cleanup",
+        }:
             self.send_error(404)
             return
         try:
             length = int(self.headers.get("Content-Length", "0"))
             if path == "/api/training/feedback" and length > 256 * 1024:
                 raise ValueError("Training feedback exceeds 256 KB")
+            if (
+                path == "/api/training/session/experiment"
+                and length > 100 * 1024 * 1024
+            ):
+                raise ValueError("Training experiment exceeds 100 MB")
             body = self.rfile.read(length)
             if path == "/api/inspect.dst":
                 dst = body
+            elif path == "/api/training/session/create":
+                saved = create_training_session(json.loads(body))
+                payload = json.dumps(saved).encode()
+                self.send_response(201)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+            elif path == "/api/training/session/experiment":
+                saved = save_training_experiment(json.loads(body))
+                payload = json.dumps(saved).encode()
+                self.send_response(201)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+            elif path == "/api/training/session/export":
+                request = json.loads(body)
+                archive, filename = export_training_session(
+                    str(request.get("session_id", ""))
+                )
+                self.send_response(200)
+                self.send_header("Content-Type", "application/zip")
+                self.send_header(
+                    "Content-Disposition",
+                    f'attachment; filename="{filename}"',
+                )
+                self.send_header("Content-Length", str(len(archive)))
+                self.end_headers()
+                self.wfile.write(archive)
+                return
+            elif path == "/api/training/session/cleanup":
+                request = json.loads(body)
+                deleted = delete_training_session(
+                    str(request.get("session_id", ""))
+                )
+                payload = json.dumps({"deleted": deleted}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
             elif path == "/api/training/feedback":
                 saved = save_training_feedback(json.loads(body))
                 payload = json.dumps({

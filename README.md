@@ -58,6 +58,20 @@ The current UI uses the `standard` digitizing profile. Use the API to select a
 material- or product-specific profile until a profile selector is added to the
 UI.
 
+### Model-training workspace
+
+Choose **Train model** beside **Replace artwork** to review phase-specific
+color-separation, object/stackup, and stitch-construction brackets. Each
+experiment is generated once per browser session and remains available when
+switching between phases, so comparisons do not invoke the planner again.
+
+Completed experiments are staged as one temporary training session. **Export
+session** downloads a ZIP containing the source artwork, experiment manifests,
+candidate parameters and metrics, complete plans, DST files, posterized
+artwork, and virtual-sewout PNGs. The server deletes the staged session after
+the ZIP is built. Replacing artwork, discarding the session, or leaving the
+page also removes temporary plans and sewouts.
+
 ## Digitizing API
 
 All endpoints are local and accept JSON unless noted otherwise.

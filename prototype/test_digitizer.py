@@ -1,10 +1,12 @@
 from io import BytesIO
+import base64
 import json
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
 import unittest
+import zipfile
 
 from PIL import Image, ImageDraw
 
@@ -20,7 +22,11 @@ from server import (
     BRACKET_ARTIFACTS,
     Handler,
     as_dst,
+    create_training_session,
+    delete_training_session,
+    export_training_session,
     inspect_dst,
+    save_training_experiment,
     save_training_feedback,
 )
 from tools.render_stitch_preview import render
@@ -44,6 +50,7 @@ class DigitizerTest(unittest.TestCase):
     def test_training_feedback_persists_validated_pairwise_signal(self):
         payload = {
             "schema_version": 1,
+            "training_session_id": "session-123",
             "source": {
                 "name": "script-mark.png",
                 "sha256": "a" * 64,
@@ -104,7 +111,70 @@ class DigitizerTest(unittest.TestCase):
                 "construction",
                 record["learning_target"]["phase"],
             )
+            self.assertEqual(
+                "session-123",
+                record["training_session_id"],
+            )
             self.assertEqual(1, len(record["preference_pairs"]))
+
+    def test_training_session_exports_artifacts_then_clears_temp_storage(self):
+        image = Image.new("RGBA", (8, 6), (255, 255, 255, 255))
+        stream = BytesIO()
+        image.save(stream, format="PNG")
+        data_url = (
+            "data:image/png;base64,"
+            + base64.b64encode(stream.getvalue()).decode()
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            session = create_training_session({
+                "schema_version": 1,
+                "source": {"name": "white-mark.png", "data_url": data_url},
+                "settings": {"width_mm": 72, "colors": 2},
+                "origin": "basic",
+            }, output)
+            session_id = session["session_id"]
+            saved = save_training_experiment({
+                "schema_version": 1,
+                "session_id": session_id,
+                "experiment": {
+                    "phase": "construction",
+                    "parameter": "tatami_density",
+                    "reference": "0.60–1.50×",
+                    "candidates": [{
+                        "candidate_id": "tatami_density-1.0",
+                        "value": "1.0",
+                        "parameters": {"density_multiplier": 1.0},
+                        "metrics": {"stitches": 2},
+                        "posterized_data_url": data_url,
+                        "sewout_data_url": data_url,
+                        "plan": {
+                            "operations": [
+                                {"kind": "stitch", "x": 0, "y": 0},
+                                {"kind": "stitch", "x": 1, "y": 0},
+                            ],
+                        },
+                    }],
+                },
+            }, output)
+            self.assertEqual(1, saved["experiment_count"])
+            archive, filename = export_training_session(session_id, output)
+            self.assertTrue(filename.endswith(".zip"))
+            self.assertFalse((output / session_id).exists())
+            with zipfile.ZipFile(BytesIO(archive)) as bundle:
+                names = set(bundle.namelist())
+            self.assertIn("session.json", names)
+            self.assertIn(
+                "experiments/tatami_density/"
+                "tatami_density-1.0/candidate.dst",
+                names,
+            )
+            self.assertIn(
+                "experiments/tatami_density/"
+                "tatami_density-1.0/sewout.png",
+                names,
+            )
+            self.assertFalse(delete_training_session(session_id, output))
 
     def test_training_feedback_rejects_candidate_outside_comparison(self):
         with self.assertRaisesRegex(ValueError, "positive candidate"):
@@ -142,6 +212,33 @@ class DigitizerTest(unittest.TestCase):
             (ARTIFACTS_ROOT / "__not_found__").resolve(),
             escaped,
         )
+
+    def test_white_thread_survives_transparent_background_planning(self):
+        image = Image.new("RGBA", (100, 45), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((5, 5, 42, 39), fill=(252, 252, 248, 255))
+        draw.rectangle((58, 5, 95, 39), fill=(30, 72, 126, 255))
+        stream = BytesIO()
+        image.save(stream, format="PNG")
+        plan = digitize(
+            stream.getvalue(),
+            width_mm=72,
+            colors=2,
+            include_posterized=True,
+        )
+        white_regions = [
+            region for region in plan.regions
+            if all(
+                int(region.color[offset:offset + 2], 16) >= 235
+                for offset in (1, 3, 5)
+            )
+        ]
+        self.assertTrue(white_regions)
+        self.assertTrue(any(
+            operation.kind == "stitch"
+            for region in white_regions
+            for operation in region.operations
+        ))
 
     def test_single_plan_has_three_layers_and_adjustable_density(self):
         image = Image.new("RGBA", (220, 120), (0, 0, 0, 0))

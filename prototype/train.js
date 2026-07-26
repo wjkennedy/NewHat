@@ -13,6 +13,9 @@ const state={
   reasons:new Set(),
   colorAccuracy:null,
   generation:0,
+  experiments:new Map(),
+  sessionId:null,
+  sessionExported:false,
 };
 
 const PHASES={
@@ -152,6 +155,118 @@ async function requestJson(url,body){
   return response.json();
 }
 
+function updateSessionControls(message=''){
+  const completed=state.experiments.size;
+  const total=state.base?availableParameters().length:Object.keys(PARAMETERS).length;
+  document.querySelector('#sessionProgress').textContent=message||(
+    completed
+      ?`${completed} of ${total} experiments cached for this session`
+      :'No experiments cached'
+  );
+  const available=Boolean(state.sessionId&&completed);
+  const exportButton=document.querySelector('#exportSession');
+  exportButton.disabled=!available;
+  exportButton.textContent=completed?`Export session · ${completed}`:'Export session';
+  document.querySelector('#discardSession').disabled=!state.sessionId;
+}
+
+async function ensureTrainingSession(){
+  if(state.sessionId)return state.sessionId;
+  const result=await requestJson('/api/training/session/create',{
+    schema_version:1,
+    source:state.handoff.source,
+    settings:state.handoff.settings,
+    origin:state.handoff.origin,
+  });
+  state.sessionId=result.session_id;
+  state.sessionExported=false;
+  state.handoff.training_session_id=state.sessionId;
+  await writeHandoff(state.handoff);
+  updateSessionControls();
+  return state.sessionId;
+}
+
+function candidateParameters(candidate){
+  return {
+    color_merge_tolerance:candidate.option.merge,
+    fragmented_color_threshold:candidate.option.fragmented,
+    construction_mode:candidate.option.mode,
+    density_multiplier:candidate.parameter==='tatami_density'?candidate.option.value:undefined,
+    running_passes:candidate.parameter==='running_passes'||candidate.parameter==='stitch_family'?candidate.option.passes:undefined,
+    satin_spacing_mm:candidate.parameter==='satin_spacing_mm'?candidate.option.value:undefined,
+  };
+}
+
+function candidateMetricRecord(candidate){
+  return {
+    stitches:candidate.metrics.stitches,
+    trims:candidate.metrics.trims,
+    jumps:candidate.metrics.jumps,
+    bracket_blockers:candidate.metrics.blockers,
+    bracket_warnings:candidate.metrics.warnings,
+    status:candidate.metrics.status,
+    color_count:candidate.metrics.palette.length,
+    palette:candidate.metrics.palette,
+    quantized_color_count:candidate.metrics.separation.quantized_color_count,
+    merged_shade_count:candidate.metrics.separation.merged_shade_count,
+    mean_color_error_rgb:candidate.metrics.separation.mean_color_error_rgb,
+    stitch_types:candidate.metrics.stitchTypes,
+    object_count:candidate.metrics.objects,
+  };
+}
+
+function currentReview(){
+  return {
+    positive_candidate_id:state.positive,
+    negative_candidate_ids:[...state.negatives],
+    reasons:[...state.reasons],
+    color_accuracy:state.colorAccuracy,
+    note:document.querySelector('#reviewNote').value.trim(),
+  };
+}
+
+function captureCurrentExperiment(){
+  const experiment=state.experiments.get(state.parameter);
+  if(experiment)experiment.review={
+    ...currentReview(),
+    ...(experiment.review?.training_record_id
+      ?{training_record_id:experiment.review.training_record_id}
+      :{}),
+  };
+}
+
+function releaseCandidateMemory(candidates){
+  candidates.forEach(candidate=>{
+    if(candidate.payload?.posterization)delete candidate.payload.posterization.preview_data_url;
+  });
+}
+
+async function cleanupTrainingSession({clearMemory=false,keepalive=false}={}){
+  const sessionId=state.sessionId;
+  if(sessionId){
+    const body=JSON.stringify({session_id:sessionId});
+    if(keepalive){
+      fetch('/api/training/session/cleanup',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body,
+        keepalive:true,
+      }).catch(()=>{});
+    }else{
+      await requestJson('/api/training/session/cleanup',{session_id:sessionId});
+    }
+  }
+  state.sessionId=null;
+  if(state.handoff)delete state.handoff.training_session_id;
+  if(clearMemory){
+    state.experiments.forEach(experiment=>releaseCandidateMemory(experiment.candidates));
+    state.experiments.clear();
+    state.candidates=[];
+    candidatesElement.replaceChildren();
+  }
+  updateSessionControls();
+}
+
 function rasterRequest(overrides={}){
   const settings=state.handoff.settings;
   return {
@@ -205,6 +320,7 @@ function renderParameters(){
     button.type='button';
     button.role='tab';
     button.ariaSelected=String(state.parameter===id);
+    button.classList.toggle('completed',state.experiments.has(id));
     button.innerHTML=`${parameter.label}<span>${parameter.reference}</span>`;
     button.addEventListener('click',()=>selectParameter(id));
     container.append(button);
@@ -213,6 +329,7 @@ function renderParameters(){
   document.querySelector('#referenceRange').textContent=parameter?.reference||'—';
   document.querySelector('#referenceCopy').textContent=parameter?.copy||'The bracket keeps every other planner input fixed.';
   document.querySelector('#bracketTitle').textContent=parameter?`${PHASES[parameter.phase]} · ${parameter.label}`:'Controlled comparison';
+  updateSessionControls();
 }
 
 function mutateDocument(source,parameter,value){
@@ -320,7 +437,14 @@ function candidateFingerprint(candidate){
 }
 
 function operationColors(candidate){
-  const objectColors=new Map((candidate.document?.objects||candidate.payload.document?.objects||[]).map(object=>[object.id,object.color]));
+  const colorObjects=[
+    ...(candidate.payload.regions||[]),
+    ...(candidate.document?.objects||candidate.payload.document?.objects||[]),
+  ];
+  const objectColors=new Map(colorObjects.flatMap(object=>[
+    [object.id,object.color],
+    [object.region_id,object.color],
+  ]).filter(([identifier,color])=>identifier&&color));
   const palette=candidate.payload.palette?.length?candidate.payload.palette:['#e85d8e'];
   let colorIndex=0;
   return (candidate.payload.operations||[]).map(operation=>{
@@ -442,6 +566,77 @@ function renderCandidate(candidate){
   card.classList.add('ready');
 }
 
+function restoreReview(review={}){
+  state.positive=review.positive_candidate_id||null;
+  state.negatives=new Set(review.negative_candidate_ids||[]);
+  state.reasons=new Set(review.reasons||[]);
+  state.colorAccuracy=review.color_accuracy||null;
+  document.querySelector('#reviewNote').value=review.note||'';
+  document.querySelectorAll('#reasonList button').forEach(button=>{
+    button.classList.toggle('active',state.reasons.has(button.dataset.reason));
+  });
+  document.querySelectorAll('#colorAccuracy button').forEach(button=>{
+    button.classList.toggle('active',button.dataset.accuracy===state.colorAccuracy);
+  });
+}
+
+function renderExperiment(experiment,{cached=false}={}){
+  candidatesElement.replaceChildren();
+  state.candidates=experiment.candidates;
+  state.candidates.forEach((candidate,index)=>{
+    candidate.index=index;
+    renderCandidate(candidate);
+  });
+  restoreReview(experiment.review);
+  document.querySelector('#bracketSummary').textContent=`${state.candidates.length} distinct alternatives${experiment.equivalentCount?` · ${experiment.equivalentCount} equivalent ${experiment.equivalentCount===1?'plan':'plans'} collapsed`:''} · ${cached?'restored from this session':'saved for cross-phase review'}`;
+  refreshSelections();
+}
+
+function artifactPlan(candidate){
+  const plan=structuredClone(candidate.payload);
+  if(plan.posterization)delete plan.posterization.preview_data_url;
+  return plan;
+}
+
+async function persistExperiment(parameter){
+  const experiment=state.experiments.get(parameter);
+  if(!experiment)return;
+  const sessionId=await ensureTrainingSession();
+  const cards=new Map(
+    [...document.querySelectorAll('.candidate')].map(card=>[
+      card.dataset.candidateId,
+      card,
+    ])
+  );
+  const candidates=experiment.candidates.map(candidate=>{
+    const card=cards.get(candidate.id);
+    return {
+      candidate_id:candidate.id,
+      value:candidate.value,
+      parameters:candidateParameters(candidate),
+      metrics:candidateMetricRecord(candidate),
+      plan:artifactPlan(candidate),
+      posterized_data_url:candidate.payload.posterization?.preview_data_url||state.handoff.source.data_url,
+      sewout_data_url:card?.querySelector('canvas')?.toDataURL('image/png'),
+    };
+  });
+  const result=await requestJson('/api/training/session/experiment',{
+    schema_version:1,
+    session_id:sessionId,
+    experiment:{
+      phase:PARAMETERS[parameter].phase,
+      parameter,
+      reference:PARAMETERS[parameter].reference,
+      candidates,
+      review:experiment.review,
+    },
+  });
+  experiment.persisted=true;
+  updateSessionControls(
+    `${result.experiment_count} experiment${result.experiment_count===1?'':'s'} cached · plans, DSTs, parameters, and renders ready`
+  );
+}
+
 function refreshSelections(){
   document.querySelectorAll('.candidate').forEach(card=>{
     const id=card.dataset.candidateId;
@@ -478,6 +673,19 @@ function toggleNegative(id){
 }
 
 async function selectParameter(parameter){
+  const previousParameter=state.parameter;
+  captureCurrentExperiment();
+  if(
+    previousParameter
+    && previousParameter!==parameter
+    && state.experiments.has(previousParameter)
+  ){
+    try{
+      await persistExperiment(previousParameter);
+    }catch(error){
+      updateSessionControls(`Previous phase remains in memory · cache update failed: ${error.message}`);
+    }
+  }
   state.parameter=parameter;
   state.positive=null;
   resetColorAccuracy();
@@ -488,6 +696,10 @@ async function selectParameter(parameter){
   state.generation+=1;
   const version=state.generation;
   renderParameters();
+  if(state.experiments.has(parameter)){
+    renderExperiment(state.experiments.get(parameter),{cached:true});
+    return;
+  }
   candidatesElement.replaceChildren();
   const options=experimentValues(parameter);
   document.querySelector('#bracketSummary').textContent=`Generating ${options.length} phase-specific plans…`;
@@ -514,7 +726,6 @@ async function selectParameter(parameter){
       fingerprints.add(fingerprint);
       result.value.index=state.candidates.length;
       state.candidates.push(result.value);
-      renderCandidate(result.value);
     }else{
       const fragment=candidateTemplate.content.cloneNode(true);
       const card=fragment.querySelector('.candidate');
@@ -524,8 +735,22 @@ async function selectParameter(parameter){
       candidatesElement.append(fragment);
     }
   });
-  document.querySelector('#bracketSummary').textContent=`${state.candidates.length} distinct alternatives${equivalentCount?` · ${equivalentCount} equivalent ${equivalentCount===1?'plan':'plans'} collapsed`:''} · reviewed in final-file context`;
-  refreshSelections();
+  const experiment={
+    parameter,
+    phase:PARAMETERS[parameter].phase,
+    candidates:state.candidates,
+    equivalentCount,
+    review:currentReview(),
+    persisted:false,
+  };
+  state.experiments.set(parameter,experiment);
+  renderParameters();
+  renderExperiment(experiment);
+  try{
+    await persistExperiment(parameter);
+  }catch(error){
+    updateSessionControls(`Candidates retained in this window · artifact cache failed: ${error.message}`);
+  }
 }
 
 async function sourceHash(dataUrl){
@@ -545,6 +770,7 @@ async function saveSignal(){
   try{
     const payload={
       schema_version:1,
+      training_session_id:state.sessionId,
       source:{
         name:state.handoff.source.name,
         sha256:await sourceHash(state.handoff.source.data_url),
@@ -561,29 +787,8 @@ async function saveSignal(){
         candidates:state.candidates.map(candidate=>({
           candidate_id:candidate.id,
           value:candidate.value,
-          parameters:{
-            color_merge_tolerance:candidate.option.merge,
-            fragmented_color_threshold:candidate.option.fragmented,
-            construction_mode:candidate.option.mode,
-            density_multiplier:candidate.parameter==='tatami_density'?candidate.option.value:undefined,
-            running_passes:candidate.parameter==='running_passes'||candidate.parameter==='stitch_family'?candidate.option.passes:undefined,
-            satin_spacing_mm:candidate.parameter==='satin_spacing_mm'?candidate.option.value:undefined,
-          },
-          metrics:{
-            stitches:candidate.metrics.stitches,
-            trims:candidate.metrics.trims,
-            jumps:candidate.metrics.jumps,
-            bracket_blockers:candidate.metrics.blockers,
-            bracket_warnings:candidate.metrics.warnings,
-            status:candidate.metrics.status,
-            color_count:candidate.metrics.palette.length,
-            palette:candidate.metrics.palette,
-            quantized_color_count:candidate.metrics.separation.quantized_color_count,
-            merged_shade_count:candidate.metrics.separation.merged_shade_count,
-            mean_color_error_rgb:candidate.metrics.separation.mean_color_error_rgb,
-            stitch_types:candidate.metrics.stitchTypes,
-            object_count:candidate.metrics.objects,
-          },
+          parameters:candidateParameters(candidate),
+          metrics:candidateMetricRecord(candidate),
         })),
       },
       reinforcement:{
@@ -595,6 +800,14 @@ async function saveSignal(){
       },
     };
     const result=await requestJson('/api/training/feedback',payload);
+    const experiment=state.experiments.get(state.parameter);
+    if(experiment){
+      experiment.review={
+        ...currentReview(),
+        training_record_id:result.record_id,
+      };
+      await persistExperiment(state.parameter);
+    }
     button.textContent='Training signal saved';
     status.textContent=`Record ${result.record_id}`;
   }catch(error){
@@ -624,16 +837,68 @@ document.querySelector('#colorAccuracy').addEventListener('click',event=>{
   refreshSelections();
 });
 document.querySelector('#saveSignal').addEventListener('click',saveSignal);
+document.querySelector('#exportSession').addEventListener('click',async()=>{
+  const button=document.querySelector('#exportSession');
+  if(!state.sessionId)return;
+  captureCurrentExperiment();
+  button.disabled=true;
+  button.textContent='Packaging session…';
+  try{
+    if(state.experiments.has(state.parameter)){
+      await persistExperiment(state.parameter);
+    }
+    const response=await fetch('/api/training/session/export',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({session_id:state.sessionId}),
+    });
+    if(!response.ok)throw Error((await response.text())||'Session export failed');
+    const blob=await response.blob();
+    const disposition=response.headers.get('Content-Disposition')||'';
+    const filename=disposition.match(/filename="([^"]+)"/)?.[1]||'training-session.zip';
+    const url=URL.createObjectURL(blob);
+    const link=document.createElement('a');
+    link.href=url;
+    link.download=filename;
+    link.click();
+    setTimeout(()=>URL.revokeObjectURL(url),1000);
+    state.sessionId=null;
+    state.sessionExported=true;
+    delete state.handoff.training_session_id;
+    await writeHandoff(state.handoff);
+    updateSessionControls('Session exported · temporary plans and sewouts deleted');
+  }catch(error){
+    button.disabled=false;
+    button.textContent='Export session';
+    updateSessionControls(`Could not export session · ${error.message}`);
+  }
+});
+document.querySelector('#discardSession').addEventListener('click',async()=>{
+  try{
+    await cleanupTrainingSession({clearMemory:true});
+    state.parameter=null;
+    renderParameters();
+    document.querySelector('#bracketSummary').textContent='Temporary session deleted';
+    updateSessionControls('Temporary plans and sewouts deleted');
+  }catch(error){
+    updateSessionControls(`Could not delete temporary session · ${error.message}`);
+  }
+});
 document.querySelector('#replaceArtwork').addEventListener('click',()=>{
   artworkFile.value='';
   artworkFile.click();
 });
-artworkFile.addEventListener('change',()=>{
+artworkFile.addEventListener('change',async()=>{
   const file=artworkFile.files[0];
   if(!file)return;
   if(file.size>10*1024*1024){
     document.querySelector('#bracketSummary').textContent='Choose artwork smaller than 10 MB.';
     return;
+  }
+  try{
+    await cleanupTrainingSession({clearMemory:true});
+  }catch{
+    // The new source remains usable if a stale temporary session vanished.
   }
   const reader=new FileReader();
   reader.onload=async()=>{
@@ -646,11 +911,20 @@ artworkFile.addEventListener('change',()=>{
       created_at:new Date().toISOString(),
     };
     state.base=null;
+    state.parameter=null;
+    state.experiments.clear();
+    state.sessionId=null;
+    state.sessionExported=false;
     await writeHandoff(state.handoff);
     updateSource();
     await initializePlanner();
   };
   reader.readAsDataURL(file);
+});
+window.addEventListener('pagehide',()=>{
+  if(state.sessionId&&!state.sessionExported){
+    cleanupTrainingSession({keepalive:true});
+  }
 });
 
 async function initializePlanner(){
@@ -676,6 +950,15 @@ async function initializePlanner(){
   document.querySelector('#returnLink').href=returnTarget;
   try{
     state.handoff=await readHandoff();
+    if(state.handoff?.training_session_id){
+      state.sessionId=state.handoff.training_session_id;
+      try{
+        await cleanupTrainingSession();
+      }catch{
+        state.sessionId=null;
+        delete state.handoff.training_session_id;
+      }
+    }
     updateSource();
     await initializePlanner();
   }catch(error){
