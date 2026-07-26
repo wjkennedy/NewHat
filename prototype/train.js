@@ -652,6 +652,10 @@ async function persistExperiment(parameter,{recoverMissingSession=true}={}){
     }
     throw error;
   }
+  if(result.recovered_without_source&&recoverMissingSession){
+    await cleanupTrainingSession();
+    return persistExperiment(parameter,{recoverMissingSession:false});
+  }
   experiment.persisted=true;
   updateSessionControls(
     `${result.experiment_count} experiment${result.experiment_count===1?'':'s'} cached · plans, DSTs, parameters, and renders ready`

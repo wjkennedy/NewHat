@@ -123,7 +123,7 @@ class DigitizerTest(unittest.TestCase):
             )
             self.assertEqual(1, len(record["preference_pairs"]))
 
-    def test_training_session_exports_artifacts_then_clears_temp_storage(self):
+    def test_training_session_archive_remains_retryable_until_cleanup(self):
         image = Image.new("RGBA", (8, 6), (255, 255, 255, 255))
         stream = BytesIO()
         image.save(stream, format="PNG")
@@ -166,7 +166,7 @@ class DigitizerTest(unittest.TestCase):
             self.assertEqual(1, saved["experiment_count"])
             archive, filename = export_training_session(session_id, output)
             self.assertTrue(filename.endswith(".zip"))
-            self.assertFalse((output / session_id).exists())
+            self.assertTrue((output / session_id).exists())
             with zipfile.ZipFile(BytesIO(archive)) as bundle:
                 names = set(bundle.namelist())
             self.assertIn("session.json", names)
@@ -180,7 +180,32 @@ class DigitizerTest(unittest.TestCase):
                 "tatami_density-1.0/sewout.png",
                 names,
             )
-            self.assertFalse(delete_training_session(session_id, output))
+            self.assertTrue(delete_training_session(session_id, output))
+            self.assertFalse((output / session_id).exists())
+            recovered = save_training_experiment({
+                "schema_version": 1,
+                "session_id": session_id,
+                "experiment": {
+                    "phase": "construction",
+                    "parameter": "tatami_density",
+                    "candidates": [{
+                        "candidate_id": "tatami_density-1.0",
+                        "plan": {
+                            "operations": [
+                                {"kind": "stitch", "x": 0, "y": 0},
+                                {"kind": "stitch", "x": 1, "y": 0},
+                            ],
+                        },
+                    }],
+                },
+            }, output)
+            self.assertTrue(recovered["recovered_without_source"])
+            recovered_manifest = json.loads(
+                (output / session_id / "session.json").read_text()
+            )
+            self.assertTrue(
+                recovered_manifest["recovered_without_source"]
+            )
 
     def test_training_feedback_rejects_candidate_outside_comparison(self):
         with self.assertRaisesRegex(ValueError, "positive candidate"):

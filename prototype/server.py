@@ -131,8 +131,23 @@ def save_training_experiment(
     session_id = str(payload.get("session_id", ""))
     root = _session_path(session_id, output)
     manifest_path = root / "session.json"
+    recovered_without_source = False
     if not manifest_path.exists():
-        raise ValueError("Training session was not found or was already cleared")
+        recovered_without_source = True
+        root.mkdir(parents=True, exist_ok=True)
+        _write_json(manifest_path, {
+            "schema_version": 1,
+            "session_id": session_id,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "source": {
+                "name": "Source unavailable during session recovery",
+                "artifact": None,
+            },
+            "settings": {},
+            "origin": "recovered",
+            "recovered_without_source": True,
+            "experiments": {},
+        })
     experiment = payload.get("experiment")
     if not isinstance(experiment, dict):
         raise ValueError("Training experiment is required")
@@ -212,13 +227,14 @@ def save_training_experiment(
         "parameter": parameter,
         "candidate_count": len(candidate_summaries),
         "experiment_count": len(manifest["experiments"]),
+        "recovered_without_source": recovered_without_source,
     }
 
 
 def export_training_session(
     session_id: str, output: Path = TRAINING_SESSION_ROOT
 ) -> tuple[bytes, str]:
-    """Build an in-memory archive, then delete the temporary session."""
+    """Build an in-memory archive without clearing the retryable session."""
     root = _session_path(session_id, output)
     if not (root / "session.json").exists():
         raise ValueError("Training session was not found or was already cleared")
@@ -229,7 +245,6 @@ def export_training_session(
         for path in sorted(root.rglob("*")):
             if path.is_file():
                 bundle.write(path, path.relative_to(root))
-    shutil.rmtree(root)
     return archive.getvalue(), f"training-session-{session_id}.zip"
 
 
@@ -479,8 +494,9 @@ class Handler(SimpleHTTPRequestHandler):
                 return
             elif path == "/api/training/session/export":
                 request = json.loads(body)
+                session_id = str(request.get("session_id", ""))
                 archive, filename = export_training_session(
-                    str(request.get("session_id", ""))
+                    session_id
                 )
                 self.send_response(200)
                 self.send_header("Content-Type", "application/zip")
@@ -490,7 +506,12 @@ class Handler(SimpleHTTPRequestHandler):
                 )
                 self.send_header("Content-Length", str(len(archive)))
                 self.end_headers()
-                self.wfile.write(archive)
+                try:
+                    self.wfile.write(archive)
+                except (BrokenPipeError, ConnectionResetError):
+                    # Keep the session intact so the browser can retry.
+                    return
+                delete_training_session(session_id)
                 return
             elif path == "/api/training/session/cleanup":
                 request = json.loads(body)
