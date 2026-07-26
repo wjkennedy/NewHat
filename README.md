@@ -69,8 +69,9 @@ Completed experiments are staged as one temporary training session. **Export
 session** downloads a ZIP containing the source artwork, experiment manifests,
 candidate parameters and metrics, complete plans, DST files, posterized
 artwork, and virtual-sewout PNGs. The server deletes the staged session after
-the ZIP is built. Replacing artwork, discarding the session, or leaving the
-page also removes temporary plans and sewouts.
+the ZIP is built. Replacing artwork or explicitly discarding the session also
+removes temporary plans and sewouts. Browser navigation does not clear an
+active session because the page may remain live in the back/forward cache.
 
 ## Digitizing API
 

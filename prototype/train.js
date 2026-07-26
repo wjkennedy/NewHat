@@ -151,7 +151,11 @@ function updateSource(){
 
 async function requestJson(url,body){
   const response=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  if(!response.ok)throw Error((await response.text())||'Planner request failed');
+  if(!response.ok){
+    const error=Error((await response.text())||'Planner request failed');
+    error.status=response.status;
+    throw error;
+  }
   return response.json();
 }
 
@@ -163,11 +167,11 @@ function updateSessionControls(message=''){
       ?`${completed} of ${total} experiments cached for this session`
       :'No experiments cached'
   );
-  const available=Boolean(state.sessionId&&completed);
+  const available=Boolean(completed);
   const exportButton=document.querySelector('#exportSession');
   exportButton.disabled=!available;
   exportButton.textContent=completed?`Export session · ${completed}`:'Export session';
-  document.querySelector('#discardSession').disabled=!state.sessionId;
+  document.querySelector('#discardSession').disabled=!state.sessionId&&!completed;
 }
 
 async function ensureTrainingSession(){
@@ -238,23 +242,15 @@ function captureCurrentExperiment(){
 function releaseCandidateMemory(candidates){
   candidates.forEach(candidate=>{
     if(candidate.payload?.posterization)delete candidate.payload.posterization.preview_data_url;
+    delete candidate.posterizedDataUrl;
+    delete candidate.sewoutDataUrl;
   });
 }
 
-async function cleanupTrainingSession({clearMemory=false,keepalive=false}={}){
+async function cleanupTrainingSession({clearMemory=false}={}){
   const sessionId=state.sessionId;
   if(sessionId){
-    const body=JSON.stringify({session_id:sessionId});
-    if(keepalive){
-      fetch('/api/training/session/cleanup',{
-        method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body,
-        keepalive:true,
-      }).catch(()=>{});
-    }else{
-      await requestJson('/api/training/session/cleanup',{session_id:sessionId});
-    }
+    await requestJson('/api/training/session/cleanup',{session_id:sessionId});
   }
   state.sessionId=null;
   if(state.handoff)delete state.handoff.training_session_id;
@@ -562,7 +558,10 @@ function renderCandidate(candidate){
   positive.addEventListener('click',()=>choosePositive(candidate.id));
   negative.addEventListener('click',()=>toggleNegative(candidate.id));
   candidatesElement.append(fragment);
-  drawSewout(card.querySelector('canvas'),candidate);
+  const canvas=card.querySelector('canvas');
+  drawSewout(canvas,candidate);
+  candidate.posterizedDataUrl=posterized.src;
+  candidate.sewoutDataUrl=canvas.toDataURL('image/png');
   card.classList.add('ready');
 }
 
@@ -598,7 +597,7 @@ function artifactPlan(candidate){
   return plan;
 }
 
-async function persistExperiment(parameter){
+async function persistExperiment(parameter,{recoverMissingSession=true}={}){
   const experiment=state.experiments.get(parameter);
   if(!experiment)return;
   const sessionId=await ensureTrainingSession();
@@ -610,27 +609,49 @@ async function persistExperiment(parameter){
   );
   const candidates=experiment.candidates.map(candidate=>{
     const card=cards.get(candidate.id);
+    const currentCanvas=card?.querySelector('canvas');
+    if(currentCanvas)candidate.sewoutDataUrl=currentCanvas.toDataURL('image/png');
+    candidate.posterizedDataUrl=(
+      candidate.payload.posterization?.preview_data_url
+      ||candidate.posterizedDataUrl
+      ||state.handoff.source.data_url
+    );
     return {
       candidate_id:candidate.id,
       value:candidate.value,
       parameters:candidateParameters(candidate),
       metrics:candidateMetricRecord(candidate),
       plan:artifactPlan(candidate),
-      posterized_data_url:candidate.payload.posterization?.preview_data_url||state.handoff.source.data_url,
-      sewout_data_url:card?.querySelector('canvas')?.toDataURL('image/png'),
+      posterized_data_url:candidate.posterizedDataUrl,
+      sewout_data_url:candidate.sewoutDataUrl,
     };
   });
-  const result=await requestJson('/api/training/session/experiment',{
-    schema_version:1,
-    session_id:sessionId,
-    experiment:{
-      phase:PARAMETERS[parameter].phase,
-      parameter,
-      reference:PARAMETERS[parameter].reference,
-      candidates,
-      review:experiment.review,
-    },
-  });
+  let result;
+  try{
+    result=await requestJson('/api/training/session/experiment',{
+      schema_version:1,
+      session_id:sessionId,
+      experiment:{
+        phase:PARAMETERS[parameter].phase,
+        parameter,
+        reference:PARAMETERS[parameter].reference,
+        candidates,
+        review:experiment.review,
+      },
+    });
+  }catch(error){
+    if(
+      recoverMissingSession
+      &&error.status===400
+      &&/not found|already cleared/i.test(error.message)
+    ){
+      state.sessionId=null;
+      delete state.handoff.training_session_id;
+      await writeHandoff(state.handoff);
+      return persistExperiment(parameter,{recoverMissingSession:false});
+    }
+    throw error;
+  }
   experiment.persisted=true;
   updateSessionControls(
     `${result.experiment_count} experiment${result.experiment_count===1?'':'s'} cached · plans, DSTs, parameters, and renders ready`
@@ -839,13 +860,13 @@ document.querySelector('#colorAccuracy').addEventListener('click',event=>{
 document.querySelector('#saveSignal').addEventListener('click',saveSignal);
 document.querySelector('#exportSession').addEventListener('click',async()=>{
   const button=document.querySelector('#exportSession');
-  if(!state.sessionId)return;
+  if(!state.experiments.size)return;
   captureCurrentExperiment();
   button.disabled=true;
   button.textContent='Packaging session…';
   try{
-    if(state.experiments.has(state.parameter)){
-      await persistExperiment(state.parameter);
+    for(const parameter of state.experiments.keys()){
+      await persistExperiment(parameter);
     }
     const response=await fetch('/api/training/session/export',{
       method:'POST',
@@ -921,12 +942,6 @@ artworkFile.addEventListener('change',async()=>{
   };
   reader.readAsDataURL(file);
 });
-window.addEventListener('pagehide',()=>{
-  if(state.sessionId&&!state.sessionExported){
-    cleanupTrainingSession({keepalive:true});
-  }
-});
-
 async function initializePlanner(){
   if(!state.handoff?.source?.data_url)return;
   candidatesElement.innerHTML='<div class="initial-loading"><b>Interpreting embroidery objects…</b><span>Building the candidate parameter space.</span></div>';

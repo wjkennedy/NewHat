@@ -37,6 +37,7 @@ class DigitizerTest(unittest.TestCase):
         prototype_root = Path(__file__).resolve().parent
         workspace = (prototype_root / "index.html").read_text()
         training = (prototype_root / "train.html").read_text().lower()
+        training_script = (prototype_root / "train.js").read_text()
         self.assertIn('id="trainModel"', workspace)
         self.assertIn("train model", workspace.lower())
         self.assertIn("source art", training)
@@ -46,6 +47,11 @@ class DigitizerTest(unittest.TestCase):
         self.assertIn("training signal", training)
         self.assertNotIn("job preflight", training)
         self.assertNotIn("needle bar", training)
+        self.assertNotIn("pagehide", training_script)
+        self.assertIn(
+            "for(const parameter of state.experiments.keys())",
+            training_script,
+        )
 
     def test_training_feedback_persists_validated_pairwise_signal(self):
         payload = {
