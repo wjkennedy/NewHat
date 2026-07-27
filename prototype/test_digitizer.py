@@ -34,6 +34,38 @@ from tools.render_stitch_preview import render
 
 
 class DigitizerTest(unittest.TestCase):
+    def _training_source_data_url(self):
+        image = Image.new("RGBA", (8, 6), (255, 255, 255, 255))
+        stream = BytesIO()
+        image.save(stream, format="PNG")
+        return (
+            "data:image/png;base64,"
+            + base64.b64encode(stream.getvalue()).decode()
+        )
+
+    def _review_scores(self, candidate_ids):
+        axes = {
+            "silhouette_fidelity",
+            "detail_retention",
+            "boundary_smoothness",
+            "lettering_legibility",
+            "negative_space_integrity",
+            "coverage",
+            "stitch_family_suitability",
+            "color_fidelity",
+            "thread_economy",
+            "path_efficiency",
+            "visible_defect_severity",
+            "production_acceptability",
+        }
+        return {
+            candidate_id: {
+                axis: (1 if axis == "visible_defect_severity" else 4)
+                for axis in axes
+            }
+            for candidate_id in candidate_ids
+        }
+
     def test_dst_export_does_not_require_optional_xml_writer(self):
         script = """
 import builtins
@@ -229,13 +261,7 @@ assert len(dst) > 512
             )
 
     def test_training_session_archive_remains_retryable_until_cleanup(self):
-        image = Image.new("RGBA", (8, 6), (255, 255, 255, 255))
-        stream = BytesIO()
-        image.save(stream, format="PNG")
-        data_url = (
-            "data:image/png;base64,"
-            + base64.b64encode(stream.getvalue()).decode()
-        )
+        data_url = self._training_source_data_url()
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary)
             session = create_training_session({
@@ -253,9 +279,12 @@ assert len(dst) > 512
                     "parameter": "tatami_density",
                     "reference": "0.60–1.50×",
                     "candidates": [{
-                        "candidate_id": "tatami_density-1.0",
-                        "value": "1.0",
-                        "parameters": {"density_multiplier": 1.0},
+                        "candidate_id": "tatami_density-0.7",
+                        "value": "0.7",
+                        "parameters": {
+                            "construction_mode": "tatami",
+                            "density_multiplier": 0.7,
+                        },
                         "metrics": {"stitches": 2},
                         "posterized_data_url": data_url,
                         "sewout_data_url": data_url,
@@ -270,21 +299,38 @@ assert len(dst) > 512
             }, output)
             self.assertEqual(1, saved["experiment_count"])
             archive, filename = export_training_session(session_id, output)
-            self.assertTrue(filename.endswith(".zip"))
+            self.assertTrue(filename.endswith("-v2.zip"))
             self.assertTrue((output / session_id).exists())
             with zipfile.ZipFile(BytesIO(archive)) as bundle:
                 names = set(bundle.namelist())
-            self.assertIn("session.json", names)
-            self.assertIn(
-                "experiments/tatami_density/"
-                "tatami_density-1.0/candidate.dst",
-                names,
+                manifest = json.loads(bundle.read("manifest.json"))
+                candidate_path = manifest["indexes"]["candidates"][0]
+                candidate = json.loads(bundle.read(candidate_path))
+                candidate_root = candidate_path.rsplit("/", 1)[0]
+                action = json.loads(bundle.read(
+                    f"{candidate_root}/action.json"
+                ))
+                artifacts = json.loads(bundle.read(
+                    f"{candidate_root}/artifact-refs.json"
+                ))["artifacts"]
+                checksums = bundle.read("checksums.sha256").decode()
+                self.assertEqual("COMPLETE", bundle.namelist()[-1])
+            self.assertIn("manifest.json", names)
+            self.assertIn("COMPLETE", names)
+            self.assertIn("checksums.sha256", names)
+            self.assertEqual("2.0.0", manifest["schema_version"])
+            self.assertEqual("parameter_study", manifest["record_type"])
+            self.assertFalse(manifest["training_ready"])
+            self.assertEqual(
+                {
+                    "construction_mode": "tatami",
+                    "density_multiplier": 0.7,
+                },
+                action["action_delta"],
             )
-            self.assertIn(
-                "experiments/tatami_density/"
-                "tatami_density-1.0/sewout.png",
-                names,
-            )
+            self.assertTrue(artifacts["dst"]["path"] in names)
+            self.assertTrue(artifacts["virtual_sewout"]["path"] in names)
+            self.assertIn("manifest.json", checksums)
             self.assertTrue(delete_training_session(session_id, output))
             self.assertFalse((output / session_id).exists())
             recovered = save_training_experiment({
@@ -312,6 +358,207 @@ assert len(dst) > 512
                 recovered_manifest["recovered_without_source"]
             )
 
+    def test_training_bundle_deduplicates_effective_outputs_and_checksums(self):
+        data_url = self._training_source_data_url()
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            session = create_training_session({
+                "schema_version": 1,
+                "source": {"name": "same-output.png", "data_url": data_url},
+                "settings": {"width_mm": 72, "colors": 2},
+                "baseline_resolved_parameters": {
+                    "construction_mode": "tatami",
+                    "density_multiplier": 1.0,
+                },
+            }, output)
+            operations = [
+                {
+                    "kind": "stitch", "x": 0, "y": 0,
+                    "role": "fill_underlay", "region_id": "region-1",
+                },
+                {
+                    "kind": "stitch", "x": 1, "y": 0,
+                    "role": "top_fill", "region_id": "region-1",
+                },
+            ]
+            candidates = []
+            for value in (0.7, 0.85):
+                candidates.append({
+                    "candidate_id": f"tatami_density-{value}",
+                    "value": str(value),
+                    "action_delta": {"density_multiplier": value},
+                    "resolved_parameters": {
+                        "construction_mode": "tatami",
+                        "density_multiplier": value,
+                    },
+                    "metrics": {"status": "pass"},
+                    "posterized_data_url": data_url,
+                    "sewout_data_url": data_url,
+                    "plan": {
+                        "dimensions_mm": {"width": 54.78, "height": 55},
+                        "posterization": {
+                            "source_size_px": {"width": 8, "height": 6},
+                        },
+                        "regions": [{
+                            "id": "region-1",
+                            "stitch_type": "fill",
+                            "color": "#ffffff",
+                        }],
+                        "operations": operations,
+                        "drc": {"budget_pass": False},
+                    },
+                })
+            save_training_experiment({
+                "schema_version": 1,
+                "session_id": session["session_id"],
+                "experiment": {
+                    "phase": "construction",
+                    "parameter": "tatami_density",
+                    "parent_state_id": session["baseline_state_id"],
+                    "parent_resolved_parameters": {
+                        "construction_mode": "tatami",
+                        "density_multiplier": 1.0,
+                    },
+                    "candidates": candidates,
+                },
+            }, output)
+            archive, _ = export_training_session(
+                session["session_id"], output
+            )
+            with zipfile.ZipFile(BytesIO(archive)) as bundle:
+                manifest = json.loads(bundle.read("manifest.json"))
+                candidate_records = [
+                    json.loads(bundle.read(path))
+                    for path in manifest["indexes"]["candidates"]
+                ]
+                effective = json.loads(bundle.read(
+                    manifest["indexes"]["effective_candidates"][0]
+                ))
+                checksum_lines = (
+                    bundle.read("checksums.sha256").decode().splitlines()
+                )
+                for line in checksum_lines:
+                    expected, path = line.split("  ", 1)
+                    self.assertEqual(
+                        expected,
+                        __import__("hashlib").sha256(
+                            bundle.read(path)
+                        ).hexdigest(),
+                    )
+                drc = json.loads(bundle.read(
+                    candidate_records[0]["drc_path"]
+                ))
+            self.assertEqual(2, manifest["summary"]["candidates"])
+            self.assertEqual(1, manifest["summary"]["effective_candidates"])
+            self.assertEqual(1, manifest["summary"]["duplicate_outputs"])
+            self.assertEqual(
+                {0.5},
+                {item["learning_weight"] for item in candidate_records},
+            )
+            self.assertEqual(2, len(effective["candidate_ids"]))
+            self.assertEqual(
+                {"review"},
+                {item["status"]["status"] for item in candidate_records},
+            )
+            self.assertEqual(
+                "eligible",
+                drc["authoritative_status"]["hard_feasibility_status"],
+            )
+            self.assertTrue(drc["round_trip"]["passed"])
+
+    def test_complete_review_exports_an_accepted_state_transition(self):
+        data_url = self._training_source_data_url()
+        candidate_ids = ["running_passes-1", "running_passes-2"]
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            session = create_training_session({
+                "schema_version": 1,
+                "source": {"name": "transition.png", "data_url": data_url},
+                "settings": {"width_mm": 72, "colors": 1},
+                "baseline_resolved_parameters": {
+                    "construction_mode": "multi_run",
+                    "running_passes": 3,
+                },
+            }, output)
+            candidates = []
+            for index, candidate_id in enumerate(candidate_ids, 1):
+                candidates.append({
+                    "candidate_id": candidate_id,
+                    "value": index,
+                    "action_delta": {"running_passes": index},
+                    "resolved_parameters": {
+                        "construction_mode": "multi_run",
+                        "running_passes": index,
+                    },
+                    "posterized_data_url": data_url,
+                    "sewout_data_url": data_url,
+                    "plan": {
+                        "operations": [
+                            {"kind": "stitch", "x": 0, "y": 0},
+                            {"kind": "stitch", "x": index, "y": 0},
+                            *(
+                                [{"kind": "stitch", "x": index, "y": 1}]
+                                if index == 2 else []
+                            ),
+                        ],
+                        "drc": {"budget_pass": True},
+                    },
+                })
+            state_after = "state_after_review"
+            save_training_experiment({
+                "schema_version": 1,
+                "session_id": session["session_id"],
+                "experiment": {
+                    "phase": "construction",
+                    "parameter": "running_passes",
+                    "parent_state_id": session["baseline_state_id"],
+                    "parent_resolved_parameters": {
+                        "construction_mode": "multi_run",
+                        "running_passes": 3,
+                    },
+                    "candidates": candidates,
+                    "review": {
+                        "completion_state": "complete",
+                        "disposition": "winner",
+                        "positive_candidate_id": candidate_ids[0],
+                        "reviewed_candidate_ids": candidate_ids,
+                        "ranking": candidate_ids,
+                        "candidate_scores": self._review_scores(
+                            candidate_ids
+                        ),
+                        "candidate_defects": {
+                            candidate_id: [] for candidate_id in candidate_ids
+                        },
+                        "transition": {
+                            "status": "accepted",
+                            "state_after": state_after,
+                        },
+                    },
+                },
+            }, output)
+            archive, _ = export_training_session(
+                session["session_id"], output
+            )
+            with zipfile.ZipFile(BytesIO(archive)) as bundle:
+                manifest = json.loads(bundle.read("manifest.json"))
+                transition = json.loads(bundle.read(
+                    manifest["indexes"]["transitions"][0]
+                ))
+                review = json.loads(bundle.read(
+                    manifest["indexes"]["reviews"][0]
+                ))
+                selected = next(
+                    json.loads(bundle.read(path))
+                    for path in manifest["indexes"]["candidates"]
+                    if json.loads(bundle.read(path))["display_name"]
+                    == candidate_ids[0]
+                )
+            self.assertEqual("episode", manifest["record_type"])
+            self.assertEqual(state_after, manifest["final_state_id"])
+            self.assertEqual("accepted", transition["status"])
+            self.assertEqual("complete", review["completion_state"])
+            self.assertEqual("selected", selected["status"]["status"])
+
     def test_training_feedback_rejects_candidate_outside_comparison(self):
         with self.assertRaisesRegex(ValueError, "positive candidate"):
             save_training_feedback({
@@ -332,6 +579,74 @@ assert len(dst) > 512
                     "color_accuracy": "acceptable",
                 },
             }, Path("/tmp/not-written-training-feedback"))
+
+    def test_training_feedback_records_ties_and_rejected_comparisons(self):
+        candidate_ids = ["candidate-a", "candidate-b"]
+        comparison = {
+            "phase": "construction",
+            "parameter": "running_passes",
+            "candidates": [
+                {"candidate_id": candidate_id, "value": index}
+                for index, candidate_id in enumerate(candidate_ids, 1)
+            ],
+        }
+        common = {
+            "reviewed_candidate_ids": candidate_ids,
+            "completion_state": "complete",
+            "ranking": candidate_ids,
+            "candidate_scores": self._review_scores(candidate_ids),
+            "candidate_defects": {
+                candidate_id: [] for candidate_id in candidate_ids
+            },
+            "negative_candidate_ids": [],
+            "reasons": ["thread_economy"],
+            "color_accuracy": "accurate",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            rejected = save_training_feedback({
+                "schema_version": 1,
+                "source": {
+                    "name": "rejected.png",
+                    "sha256": "d" * 64,
+                },
+                "comparison": comparison,
+                "reinforcement": {
+                    **common,
+                    "positive_candidate_id": "",
+                    "disposition": "no_acceptable_candidate",
+                },
+            }, output)
+            tied = save_training_feedback({
+                "schema_version": 1,
+                "source": {
+                    "name": "tied.png",
+                    "sha256": "e" * 64,
+                },
+                "comparison": comparison,
+                "reinforcement": {
+                    **common,
+                    "positive_candidate_id": "",
+                    "tie_candidate_ids": candidate_ids,
+                    "disposition": "tie",
+                },
+            }, output)
+            rejected_record = json.loads(
+                Path(rejected["record"]).read_text()
+            )
+            tied_record = json.loads(Path(tied["record"]).read_text())
+        self.assertEqual(
+            "no_acceptable_candidate",
+            rejected_record["learning_target"]["disposition"],
+        )
+        self.assertEqual(
+            [],
+            rejected_record["learning_target"]["preferred_candidate_ids"],
+        )
+        self.assertEqual(
+            candidate_ids,
+            tied_record["learning_target"]["preferred_candidate_ids"],
+        )
 
     def test_bracket_gallery_route_is_scoped_to_generated_artifacts(self):
         handler = Handler.__new__(Handler)

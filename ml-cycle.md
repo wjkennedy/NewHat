@@ -2,6 +2,9 @@
 
 New Hat will incorporate machine-learning training and evaluation directly into the parameter engine.
 
+The enforced portable-record and transition contract is defined in
+[`docs/machine-embroidery-training-bundle-v2.md`](docs/machine-embroidery-training-bundle-v2.md).
+
 The system will not treat stitch parameters as fixed constants, nor will it rely on a single model to emit raw DST instructions. Instead, deterministic stitch generators will operate from a versioned set of learned parameters. Candidate parameter sets will be evaluated through automated virtual sewouts and reviewer classification.
 
 The resulting feedback will become training data for future iterations.

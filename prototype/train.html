@@ -57,7 +57,10 @@
       <section class="review">
         <div class="review-heading">
           <div><p class="eyebrow" id="bracketKind">BRACKETED SEWOUTS</p><h2 id="bracketTitle">Controlled comparison</h2></div>
-          <span id="bracketSummary">Preparing candidates…</span>
+          <div class="review-heading-actions">
+            <button type="button" class="quiet diagnostic-toggle" id="diagnosticMode">Show diagnostics</button>
+            <span id="bracketSummary">Preparing candidates…</span>
+          </div>
         </div>
         <div class="candidate-grid" id="candidates" aria-live="polite"></div>
       </section>
@@ -69,6 +72,14 @@
           <p>Mark the qualities that should be reinforced. Negative candidates are optional but improve pairwise learning.</p>
         </div>
         <div class="signal-form">
+          <fieldset>
+            <legend>Comparison disposition</legend>
+            <div class="disposition-list" id="reviewDisposition" aria-label="Comparison disposition">
+              <button type="button" data-disposition="winner">One winner</button>
+              <button type="button" data-disposition="tie">Tie</button>
+              <button type="button" data-disposition="no_acceptable_candidate">No acceptable candidate</button>
+            </div>
+          </fieldset>
           <fieldset>
             <legend>Why is it better?</legend>
             <div class="reason-list" id="reasonList">
@@ -115,7 +126,9 @@
         <div class="candidate-parameter"><span></span><b></b></div>
         <div class="candidate-metrics"></div>
         <div class="candidate-evidence"></div>
+        <div class="candidate-scoring"></div>
         <div class="candidate-actions">
+          <button type="button" class="reviewed">Mark reviewed</button>
           <button type="button" class="positive">Use as positive</button>
           <button type="button" class="negative">Mark negative</button>
         </div>

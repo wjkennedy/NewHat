@@ -69,14 +69,20 @@ is generated once per browser session and remains available when switching
 between phases, so comparisons do not invoke the planner again.
 
 Completed experiments are staged as one temporary training session. **Export
-session** downloads a ZIP containing the source artwork, experiment manifests,
-candidate parameters and metrics, complete plans, DST files, posterized
-artwork, and virtual-sewout PNGs. The server deletes the staged session after
-the ZIP is delivered successfully and preserves it when delivery is interrupted
-so the export can be retried. Replacing artwork or explicitly discarding the
-session also removes temporary plans and sewouts. Browser navigation does not
-clear an active session because the page may remain live in the back/forward
-cache.
+session** compiles a bundle-v2 ZIP with immutable states, action deltas and full
+resolved parameters, effective-output deduplication, structured reviews,
+construction recipes, normalized metrics, authoritative DRC, DST round-trip
+evidence, content-addressed artifacts, schemas, checksums, and a completion
+marker. The manifest states whether the result is training-ready or only
+experiment evidence. See
+[`docs/machine-embroidery-training-bundle-v2.md`](docs/machine-embroidery-training-bundle-v2.md)
+for the evidence contract.
+
+The server deletes the staged session after the ZIP is delivered successfully
+and preserves it when delivery is interrupted so the export can be retried.
+Replacing artwork or explicitly discarding the session also removes temporary
+plans and sewouts. Browser navigation does not clear an active session because
+the page may remain live in the back/forward cache.
 
 ## Digitizing API
 

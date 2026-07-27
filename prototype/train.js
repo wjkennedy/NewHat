@@ -9,6 +9,8 @@ const state={
   parameter:null,
   candidates:[],
   positive:null,
+  disposition:'incomplete',
+  tieCandidates:new Set(),
   negatives:new Set(),
   reasons:new Set(),
   colorAccuracy:null,
@@ -16,7 +18,29 @@ const state={
   experiments:new Map(),
   sessionId:null,
   sessionExported:false,
+  currentStateId:null,
+  acceptedParameters:{},
+  transitionIds:[],
+  candidateReviews:new Map(),
+  blindMode:true,
+  blindSeed:0,
+  reviewStartedAt:null,
 };
+
+const REVIEW_AXES=[
+  ['silhouette_fidelity','Silhouette'],
+  ['detail_retention','Detail'],
+  ['boundary_smoothness','Boundary'],
+  ['lettering_legibility','Legibility'],
+  ['negative_space_integrity','Negative space'],
+  ['coverage','Coverage'],
+  ['stitch_family_suitability','Stitch family'],
+  ['color_fidelity','Color'],
+  ['thread_economy','Thread economy'],
+  ['path_efficiency','Path efficiency'],
+  ['visible_defect_severity','Visible defects'],
+  ['production_acceptability','Production'],
+];
 
 const PHASES={
   separation:'01 · COLOR SEPARATION',
@@ -164,6 +188,28 @@ function updateSource(){
   document.querySelector('#sourceSize').textContent=`${Number(handoff.settings.width_mm).toFixed(0)} mm wide · ${handoff.settings.colors} color target`;
 }
 
+function baselineParameters(){
+  const settings=state.handoff.settings;
+  return {
+    requested_width_mm:Number(settings.width_mm),
+    requested_colors:Number(settings.colors),
+    profile:settings.profile||'standard',
+    density_multiplier:Number(settings.density_multiplier||1),
+    color_merge_tolerance:8,
+    fragmented_color_threshold:.20,
+    posterization_smoothing_px:0,
+    construction_mode:'auto',
+    running_passes:3,
+    satin_spacing_mm:null,
+  };
+}
+
+function compactParameters(parameters){
+  return Object.fromEntries(
+    Object.entries(parameters).filter(([,value])=>value!==undefined)
+  );
+}
+
 async function requestJson(url,body){
   const response=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
   if(!response.ok){
@@ -205,24 +251,51 @@ async function ensureTrainingSession(){
     source:state.handoff.source,
     settings:state.handoff.settings,
     origin:state.handoff.origin,
+    rights:state.handoff.rights||{},
+    production_context:state.handoff.production_context||{},
+    baseline_resolved_parameters:baselineParameters(),
   });
   state.sessionId=result.session_id;
   state.sessionExported=false;
+  state.currentStateId=result.baseline_state_id;
+  state.acceptedParameters={
+    ...baselineParameters(),
+    ...(result.baseline_resolved_parameters||{}),
+  };
   state.handoff.training_session_id=state.sessionId;
+  state.handoff.training_state={
+    state_id:state.currentStateId,
+    resolved_parameters:state.acceptedParameters,
+    transition_ids:state.transitionIds,
+  };
   await writeHandoff(state.handoff);
   updateSessionControls();
   return state.sessionId;
 }
 
 function candidateParameters(candidate){
-  return {
+  return compactParameters({
     color_merge_tolerance:candidate.option.merge,
     fragmented_color_threshold:candidate.option.fragmented,
     posterization_smoothing_px:candidate.option.smoothing,
     construction_mode:candidate.option.mode,
     density_multiplier:candidate.parameter==='tatami_density'?candidate.option.value:undefined,
-    running_passes:candidate.parameter==='running_passes'||candidate.parameter==='stitch_family'?candidate.option.passes:undefined,
+    running_passes:(
+      candidate.parameter==='running_passes'
+        ?candidate.option.value
+        :candidate.parameter==='stitch_family'
+          ?candidate.option.passes
+          :undefined
+    ),
     satin_spacing_mm:candidate.parameter==='satin_spacing_mm'?candidate.option.value:undefined,
+  });
+}
+
+function candidateResolvedParameters(candidate){
+  return {
+    ...baselineParameters(),
+    ...state.acceptedParameters,
+    ...candidateParameters(candidate),
   };
 }
 
@@ -246,13 +319,118 @@ function candidateMetricRecord(candidate){
 }
 
 function currentReview(){
+  const reviewed=state.candidates
+    .filter(candidate=>candidateReviewState(candidate.id).reviewed)
+    .map(candidate=>candidate.id);
+  const ranking=state.candidates
+    .map(candidate=>({
+      id:candidate.id,
+      rank:candidateReviewState(candidate.id).rank,
+    }))
+    .filter(item=>item.rank!==null)
+    .sort((left,right)=>left.rank-right.rank)
+    .map(item=>item.id);
+  const candidateScores=Object.fromEntries(
+    state.candidates.map(candidate=>[
+      candidate.id,
+      {...candidateReviewState(candidate.id).scores},
+    ])
+  );
+  const candidateDefects=Object.fromEntries(
+    state.candidates.map(candidate=>[
+      candidate.id,
+      [...candidateReviewState(candidate.id).defects],
+    ])
+  );
+  const reviewStates=state.candidates.map(
+    candidate=>candidateReviewState(candidate.id)
+  );
+  const allScored=reviewStates.every(review=>
+    REVIEW_AXES.every(([axis])=>Number.isInteger(review.scores[axis]))
+  );
+  const ranks=reviewStates.map(review=>review.rank).filter(Number.isInteger);
+  const completeRanking=(
+    ranks.length===state.candidates.length
+    &&new Set(ranks).size===state.candidates.length
+    &&Math.min(...ranks)===1
+    &&Math.max(...ranks)===state.candidates.length
+  );
+  const outcomeComplete=(
+    (state.disposition==='winner'&&Boolean(state.positive))
+    ||(state.disposition==='tie'&&state.tieCandidates.size>=2)
+    ||state.disposition==='no_acceptable_candidate'
+  );
   return {
     positive_candidate_id:state.positive,
+    tie_candidate_ids:[...state.tieCandidates],
     negative_candidate_ids:[...state.negatives],
+    reviewed_candidate_ids:reviewed,
+    completion_state:(
+      reviewed.length===state.candidates.length
+      &&allScored
+      &&completeRanking
+      &&outcomeComplete
+        ?'complete'
+        :'partial'
+    ),
+    disposition:state.disposition,
+    ranking,
+    candidate_scores:candidateScores,
+    candidate_defects:candidateDefects,
+    blind_display_order:state.candidates.map(candidate=>candidate.id),
+    blind_order_seed:state.blindSeed,
+    review_ui_version:'new-hat-training-ui/2',
+    rubric_version:'embroidery-review/2.0.0',
+    review_duration_ms:(
+      state.reviewStartedAt===null
+        ?null
+        :Math.round(performance.now()-state.reviewStartedAt)
+    ),
     reasons:[...state.reasons],
     color_accuracy:state.colorAccuracy,
     note:document.querySelector('#reviewNote').value.trim(),
   };
+}
+
+async function adoptSelectedCandidate(experiment,candidate){
+  const stateAfter=`state_${crypto.randomUUID().replaceAll('-','')}`;
+  const transitionId=`transition_${crypto.randomUUID().replaceAll('-','')}`;
+  experiment.review={
+    ...experiment.review,
+    transition:{
+      status:'accepted',
+      state_before:experiment.parentStateId,
+      state_after:stateAfter,
+      transition_id:transitionId,
+      candidate_id:candidate.id,
+    },
+  };
+  await persistExperiment(experiment.parameter);
+  state.currentStateId=stateAfter;
+  state.acceptedParameters={
+    ...candidate.resolvedParameters,
+  };
+  state.transitionIds=[
+    ...state.transitionIds,
+    transitionId,
+  ];
+  for(const [parameter,cached] of [...state.experiments]){
+    if(
+      parameter!==experiment.parameter
+      &&cached.parentStateId!==state.currentStateId
+      &&!cached.review?.transition
+    ){
+      releaseCandidateMemory(cached.candidates);
+      state.experiments.delete(parameter);
+    }
+  }
+  state.handoff.training_state={
+    state_id:state.currentStateId,
+    resolved_parameters:state.acceptedParameters,
+    transition_ids:state.transitionIds,
+  };
+  await writeHandoff(state.handoff);
+  renderParameters();
 }
 
 function captureCurrentExperiment(){
@@ -279,7 +457,14 @@ async function cleanupTrainingSession({clearMemory=false}={}){
     await requestJson('/api/training/session/cleanup',{session_id:sessionId});
   }
   state.sessionId=null;
+  state.currentStateId=null;
+  state.acceptedParameters={};
+  state.transitionIds=[];
+  state.positive=null;
+  state.disposition='incomplete';
+  state.tieCandidates.clear();
   if(state.handoff)delete state.handoff.training_session_id;
+  if(state.handoff)delete state.handoff.training_state;
   if(clearMemory){
     state.experiments.forEach(experiment=>releaseCandidateMemory(experiment.candidates));
     state.experiments.clear();
@@ -300,6 +485,14 @@ function rasterRequest(overrides={}){
     fragmented_color_threshold:.20,
     posterization_smoothing_px:0,
     include_posterized:true,
+    ...compactParameters({
+      density_multiplier:state.acceptedParameters.density_multiplier,
+      color_merge_tolerance:state.acceptedParameters.color_merge_tolerance,
+      fragmented_color_threshold:state.acceptedParameters.fragmented_color_threshold,
+      posterization_smoothing_px:state.acceptedParameters.posterization_smoothing_px,
+      construction_mode:state.acceptedParameters.construction_mode,
+      running_passes:state.acceptedParameters.running_passes,
+    }),
     ...overrides,
   };
 }
@@ -372,6 +565,8 @@ function mutateDocument(source,parameter,value){
 }
 
 async function buildCandidate(parameter,option,index){
+  const startedAt=new Date().toISOString();
+  const startedClock=performance.now();
   const base=state.base;
   let payload;
   let document=base.document||null;
@@ -416,7 +611,7 @@ async function buildCandidate(parameter,option,index){
   }else{
     throw Error(`Experiment ${parameter} is not actuated for this plan`);
   }
-  return {
+  const candidate={
     id:`${parameter}-${option.id}`,
     index,
     value:option.id,
@@ -425,7 +620,16 @@ async function buildCandidate(parameter,option,index){
     phase:PARAMETERS[parameter].phase,
     payload,
     document,
+    generation:{
+      started_at_utc:startedAt,
+      completed_at_utc:new Date().toISOString(),
+      duration_ms:Math.round(performance.now()-startedClock),
+      peak_memory_bytes:null,
+    },
   };
+  candidate.actionDelta=candidateParameters(candidate);
+  candidate.resolvedParameters=candidateResolvedParameters(candidate);
+  return candidate;
 }
 
 function planMetrics(candidate){
@@ -584,6 +788,18 @@ function metricMarkup(candidate,metrics){
   ];
 }
 
+function candidateReviewState(candidateId){
+  if(!state.candidateReviews.has(candidateId)){
+    state.candidateReviews.set(candidateId,{
+      reviewed:false,
+      rank:null,
+      scores:{},
+      defects:[],
+    });
+  }
+  return state.candidateReviews.get(candidateId);
+}
+
 function renderCandidate(candidate){
   const fragment=candidateTemplate.content.cloneNode(true);
   const card=fragment.querySelector('.candidate');
@@ -615,8 +831,60 @@ function renderCandidate(candidate){
   evidence.textContent=phaseEvidence(candidate,metrics);
   const positive=fragment.querySelector('.positive');
   const negative=fragment.querySelector('.negative');
+  const reviewed=fragment.querySelector('.reviewed');
+  const reviewState=candidateReviewState(candidate.id);
+  const scoring=fragment.querySelector('.candidate-scoring');
+  const details=document.createElement('details');
+  const summary=document.createElement('summary');
+  const scoreGrid=document.createElement('div');
+  summary.textContent='Score candidate · anchored 1–5';
+  scoreGrid.className='score-grid';
+  const rankLabel=document.createElement('label');
+  const rankSelect=document.createElement('select');
+  rankLabel.className='rank-control';
+  rankLabel.textContent='Overall rank';
+  rankSelect.innerHTML='<option value="">Unranked</option>'+state.candidates.map(
+    (_,index)=>`<option value="${index+1}">${index+1}</option>`
+  ).join('');
+  rankSelect.value=reviewState.rank||'';
+  rankSelect.addEventListener('change',()=>{
+    reviewState.rank=rankSelect.value?Number(rankSelect.value):null;
+    reviewState.reviewed=true;
+    refreshSelections();
+  });
+  rankLabel.append(rankSelect);
+  scoreGrid.append(rankLabel);
+  REVIEW_AXES.forEach(([axis,label])=>{
+    const field=document.createElement('label');
+    const select=document.createElement('select');
+    field.textContent=label;
+    const anchors=(
+      axis==='visible_defect_severity'
+        ?['None','Minor','Moderate','Major','Severe']
+        :['Poor','Weak','Acceptable','Strong','Excellent']
+    );
+    select.innerHTML='<option value="">Not scored</option>'+
+      anchors.map(
+        (anchor,index)=>`<option value="${index+1}">${index+1} · ${anchor}</option>`
+      ).join('');
+    select.value=reviewState.scores[axis]||'';
+    select.addEventListener('change',()=>{
+      if(select.value)reviewState.scores[axis]=Number(select.value);
+      else delete reviewState.scores[axis];
+      reviewState.reviewed=true;
+      refreshSelections();
+    });
+    field.append(select);
+    scoreGrid.append(field);
+  });
+  details.append(summary,scoreGrid);
+  scoring.append(details);
   positive.addEventListener('click',()=>choosePositive(candidate.id));
   negative.addEventListener('click',()=>toggleNegative(candidate.id));
+  reviewed.addEventListener('click',()=>{
+    reviewState.reviewed=!reviewState.reviewed;
+    refreshSelections();
+  });
   candidatesElement.append(fragment);
   const canvas=card.querySelector('canvas');
   drawSewout(canvas,candidate);
@@ -627,9 +895,28 @@ function renderCandidate(candidate){
 
 function restoreReview(review={}){
   state.positive=review.positive_candidate_id||null;
+  state.disposition=review.disposition||(
+    state.positive?'winner':'incomplete'
+  );
+  state.tieCandidates=new Set(review.tie_candidate_ids||[]);
   state.negatives=new Set(review.negative_candidate_ids||[]);
   state.reasons=new Set(review.reasons||[]);
   state.colorAccuracy=review.color_accuracy||null;
+  state.candidateReviews=new Map();
+  const reviewed=new Set(review.reviewed_candidate_ids||[]);
+  const ranking=review.ranking||[];
+  state.candidates.forEach(candidate=>{
+    state.candidateReviews.set(candidate.id,{
+      reviewed:reviewed.has(candidate.id),
+      rank:(
+        ranking.includes(candidate.id)
+          ?ranking.indexOf(candidate.id)+1
+          :null
+      ),
+      scores:{...(review.candidate_scores?.[candidate.id]||{})},
+      defects:[...(review.candidate_defects?.[candidate.id]||[])],
+    });
+  });
   document.querySelector('#reviewNote').value=review.note||'';
   document.querySelectorAll('#reasonList button').forEach(button=>{
     button.classList.toggle('active',state.reasons.has(button.dataset.reason));
@@ -637,16 +924,23 @@ function restoreReview(review={}){
   document.querySelectorAll('#colorAccuracy button').forEach(button=>{
     button.classList.toggle('active',button.dataset.accuracy===state.colorAccuracy);
   });
+  document.querySelectorAll('#reviewDisposition button').forEach(button=>{
+    button.classList.toggle(
+      'active',button.dataset.disposition===state.disposition
+    );
+  });
 }
 
 function renderExperiment(experiment,{cached=false}={}){
   candidatesElement.replaceChildren();
   state.candidates=experiment.candidates;
+  state.blindSeed=experiment.randomSeed||0;
+  state.reviewStartedAt=performance.now();
+  restoreReview(experiment.review);
   state.candidates.forEach((candidate,index)=>{
     candidate.index=index;
     renderCandidate(candidate);
   });
-  restoreReview(experiment.review);
   document.querySelector('#bracketSummary').textContent=`${state.candidates.length} distinct alternatives${experiment.equivalentCount?` · ${experiment.equivalentCount} equivalent ${experiment.equivalentCount===1?'plan':'plans'} collapsed`:''} · ${cached?'restored from this session':'saved for cross-phase review'}`;
   refreshSelections();
 }
@@ -680,7 +974,13 @@ async function persistExperiment(parameter,{recoverMissingSession=true}={}){
       candidate_id:candidate.id,
       value:candidate.value,
       parameters:candidateParameters(candidate),
+      action_delta:candidate.actionDelta||candidateParameters(candidate),
+      resolved_parameters:(
+        candidate.resolvedParameters
+        ||candidateResolvedParameters(candidate)
+      ),
       metrics:candidateMetricRecord(candidate),
+      generation:candidate.generation,
       plan:artifactPlan(candidate),
       posterized_data_url:candidate.posterizedDataUrl,
       sewout_data_url:candidate.sewoutDataUrl,
@@ -695,6 +995,9 @@ async function persistExperiment(parameter,{recoverMissingSession=true}={}){
         phase:PARAMETERS[parameter].phase,
         parameter,
         reference:PARAMETERS[parameter].reference,
+        parent_state_id:experiment.parentStateId,
+        parent_resolved_parameters:experiment.parentResolvedParameters,
+        random_seed:experiment.randomSeed||0,
         candidates,
         review:experiment.review,
       },
@@ -726,24 +1029,104 @@ function refreshSelections(){
   document.querySelectorAll('.candidate').forEach(card=>{
     const id=card.dataset.candidateId;
     const positive=id===state.positive;
+    const tied=state.tieCandidates.has(id);
     const negative=state.negatives.has(id);
     card.classList.toggle('selected-positive',positive);
     card.classList.toggle('selected-negative',negative);
     const positiveButton=card.querySelector('.positive');
     const negativeButton=card.querySelector('.negative');
-    positiveButton.classList.toggle('active',positive);
-    positiveButton.textContent=positive?'Positive example':'Use as positive';
+    const reviewedButton=card.querySelector('.reviewed');
+    const reviewed=candidateReviewState(id).reviewed;
+    positiveButton.classList.toggle(
+      'active',state.disposition==='tie'?tied:positive
+    );
+    positiveButton.disabled=(
+      state.disposition==='no_acceptable_candidate'
+    );
+    positiveButton.textContent=(
+      state.disposition==='tie'
+        ?(tied?'Included in tie':'Include in tie')
+        :(positive?'Positive example':'Use as positive')
+    );
     negativeButton.classList.toggle('active',negative);
     negativeButton.textContent=negative?'Marked negative':'Mark negative';
+    reviewedButton.classList.toggle('active',reviewed);
+    reviewedButton.textContent=reviewed?'Reviewed':'Mark reviewed';
   });
   const positive=state.candidates.find(item=>item.id===state.positive);
-  document.querySelector('#selectionSummary').textContent=positive?`Candidate ${String.fromCharCode(65+positive.index)} is the positive example`:'Choose one positive candidate';
-  document.querySelector('#saveSignal').disabled=!state.positive||!state.reasons.size||!state.colorAccuracy;
+  const reviews=state.candidates.map(
+    candidate=>candidateReviewState(candidate.id)
+  );
+  const reviewedCount=reviews.filter(review=>review.reviewed).length;
+  const allScored=reviews.every(review=>
+    REVIEW_AXES.every(([axis])=>Number.isInteger(review.scores[axis]))
+  );
+  const ranks=reviews.map(review=>review.rank).filter(Number.isInteger);
+  const completeRanking=(
+    ranks.length===state.candidates.length
+    &&new Set(ranks).size===state.candidates.length
+    &&Math.min(...ranks)===1
+    &&Math.max(...ranks)===state.candidates.length
+  );
+  const outcomeReady=(
+    (state.disposition==='winner'&&Boolean(positive))
+    ||(state.disposition==='tie'&&state.tieCandidates.size>=2)
+    ||state.disposition==='no_acceptable_candidate'
+  );
+  document.querySelector('#selectionSummary').textContent=(
+    state.disposition==='tie'
+      ?`${state.tieCandidates.size} tied candidates · ${reviewedCount}/${state.candidates.length} reviewed`
+      :state.disposition==='no_acceptable_candidate'
+        ?`No candidate accepted · ${reviewedCount}/${state.candidates.length} reviewed`
+        :positive
+          ?`Candidate ${String.fromCharCode(65+positive.index)} preferred · ${reviewedCount}/${state.candidates.length} reviewed`
+          :`Choose one positive candidate · ${reviewedCount}/${state.candidates.length} reviewed`
+  );
+  document.querySelector('#saveSignal').disabled=(
+    !outcomeReady
+    ||!state.reasons.size
+    ||!state.colorAccuracy
+    ||reviewedCount!==state.candidates.length
+    ||!allScored
+    ||!completeRanking
+  );
 }
 
 function choosePositive(id){
+  if(state.disposition==='tie'){
+    if(state.tieCandidates.has(id))state.tieCandidates.delete(id);
+    else state.tieCandidates.add(id);
+    candidateReviewState(id).reviewed=true;
+    refreshSelections();
+    return;
+  }
   if(state.positive!==id)resetColorAccuracy();
+  state.disposition='winner';
+  document.querySelectorAll('#reviewDisposition button').forEach(button=>{
+    button.classList.toggle(
+      'active',button.dataset.disposition==='winner'
+    );
+  });
   state.positive=id;
+  state.tieCandidates.clear();
+  state.candidates.forEach(candidate=>{
+    if(
+      candidate.id!==id
+      &&candidateReviewState(candidate.id).rank===1
+    ){
+      candidateReviewState(candidate.id).rank=null;
+      const card=document.querySelector(
+        `.candidate[data-candidate-id="${CSS.escape(candidate.id)}"]`
+      );
+      if(card)card.querySelector('.rank-control select').value='';
+    }
+  });
+  candidateReviewState(id).reviewed=true;
+  candidateReviewState(id).rank=1;
+  const positiveCard=document.querySelector(
+    `.candidate[data-candidate-id="${CSS.escape(id)}"]`
+  );
+  if(positiveCard)positiveCard.querySelector('.rank-control select').value='1';
   state.negatives.delete(id);
   refreshSelections();
 }
@@ -755,6 +1138,20 @@ function toggleNegative(id){
   }
   state.negatives.has(id)?state.negatives.delete(id):state.negatives.add(id);
   refreshSelections();
+}
+
+function shuffled(values,seed){
+  const result=[...values];
+  let stateValue=seed>>>0;
+  const random=()=>{
+    stateValue=(Math.imul(stateValue,1664525)+1013904223)>>>0;
+    return stateValue/4294967296;
+  };
+  for(let index=result.length-1;index>0;index--){
+    const swap=Math.floor(random()*(index+1));
+    [result[index],result[swap]]=[result[swap],result[index]];
+  }
+  return result;
 }
 
 async function selectParameter(parameter){
@@ -773,6 +1170,8 @@ async function selectParameter(parameter){
   }
   state.parameter=parameter;
   state.positive=null;
+  state.disposition='incomplete';
+  state.tieCandidates.clear();
   resetColorAccuracy();
   state.negatives.clear();
   state.reasons.clear();
@@ -786,7 +1185,11 @@ async function selectParameter(parameter){
     return;
   }
   candidatesElement.replaceChildren();
-  const options=experimentValues(parameter);
+  state.blindSeed=crypto.getRandomValues(new Uint32Array(1))[0];
+  const options=shuffled(
+    experimentValues(parameter),
+    state.blindSeed,
+  );
   document.querySelector('#bracketSummary').textContent=`Generating ${options.length} phase-specific plans…`;
   for(let index=0;index<options.length;index++){
     const fragment=candidateTemplate.content.cloneNode(true);
@@ -824,6 +1227,9 @@ async function selectParameter(parameter){
     parameter,
     phase:PARAMETERS[parameter].phase,
     candidates:state.candidates,
+    parentStateId:state.currentStateId,
+    parentResolvedParameters:structuredClone(state.acceptedParameters),
+    randomSeed:state.blindSeed,
     equivalentCount,
     review:currentReview(),
     persisted:false,
@@ -858,6 +1264,7 @@ async function saveSignal(){
       experiment.review=currentReview();
       await persistExperiment(state.parameter);
     }
+    const structuredReview=currentReview();
     const payload={
       schema_version:1,
       training_session_id:state.sessionId,
@@ -880,13 +1287,25 @@ async function saveSignal(){
           parameters:candidateParameters(candidate),
           metrics:candidateMetricRecord(candidate),
         })),
+        blind_display_order:structuredReview.blind_display_order,
+        blind_order_seed:structuredReview.blind_order_seed,
       },
       reinforcement:{
         positive_candidate_id:state.positive,
+        tie_candidate_ids:[...state.tieCandidates],
         negative_candidate_ids:[...state.negatives],
         reasons:[...state.reasons],
         color_accuracy:state.colorAccuracy,
         note:document.querySelector('#reviewNote').value.trim(),
+        reviewed_candidate_ids:structuredReview.reviewed_candidate_ids,
+        completion_state:structuredReview.completion_state,
+        disposition:structuredReview.disposition,
+        ranking:structuredReview.ranking,
+        candidate_scores:structuredReview.candidate_scores,
+        candidate_defects:structuredReview.candidate_defects,
+        review_duration_ms:structuredReview.review_duration_ms,
+        review_ui_version:structuredReview.review_ui_version,
+        rubric_version:structuredReview.rubric_version,
       },
     };
     const result=await requestJson('/api/training/feedback',payload);
@@ -895,7 +1314,14 @@ async function saveSignal(){
         ...currentReview(),
         training_record_id:result.record_id,
       };
-      await persistExperiment(state.parameter);
+      const selected=experiment.candidates.find(
+        candidate=>candidate.id===state.positive
+      );
+      if(selected&&structuredReview.disposition==='winner'){
+        await adoptSelectedCandidate(experiment,selected);
+      }else{
+        await persistExperiment(state.parameter);
+      }
     }
     button.textContent='Training signal saved';
     status.textContent=`Record ${result.record_id}`;
@@ -914,6 +1340,17 @@ document.querySelector('#reasonList').addEventListener('click',event=>{
   button.classList.toggle('active',state.reasons.has(reason));
   refreshSelections();
 });
+document.querySelector('#reviewDisposition').addEventListener('click',event=>{
+  const button=event.target.closest('button');
+  if(!button)return;
+  state.disposition=button.dataset.disposition;
+  if(state.disposition!=='winner')state.positive=null;
+  if(state.disposition!=='tie')state.tieCandidates.clear();
+  document.querySelectorAll('#reviewDisposition button').forEach(item=>{
+    item.classList.toggle('active',item===button);
+  });
+  refreshSelections();
+});
 function resetColorAccuracy(){
   state.colorAccuracy=null;
   document.querySelectorAll('#colorAccuracy button').forEach(button=>button.classList.remove('active'));
@@ -924,6 +1361,18 @@ document.querySelector('#colorAccuracy').addEventListener('click',event=>{
   state.colorAccuracy=button.dataset.accuracy;
   document.querySelectorAll('#colorAccuracy button').forEach(item=>item.classList.toggle('active',item===button));
   refreshSelections();
+});
+function renderReviewMode(){
+  document.querySelector('.review').classList.toggle(
+    'blind',state.blindMode
+  );
+  document.querySelector('#diagnosticMode').textContent=(
+    state.blindMode?'Show diagnostics':'Return to blind view'
+  );
+}
+document.querySelector('#diagnosticMode').addEventListener('click',()=>{
+  state.blindMode=!state.blindMode;
+  renderReviewMode();
 });
 document.querySelector('#saveSignal').addEventListener('click',saveSignal);
 document.querySelector('#exportSession').addEventListener('click',async()=>{
@@ -954,6 +1403,7 @@ document.querySelector('#exportSession').addEventListener('click',async()=>{
     state.sessionId=null;
     state.sessionExported=true;
     delete state.handoff.training_session_id;
+    delete state.handoff.training_state;
     await writeHandoff(state.handoff);
     updateSessionControls('Session exported · temporary plans and sewouts deleted');
   }catch(error){
@@ -1004,6 +1454,12 @@ artworkFile.addEventListener('change',async()=>{
     state.experiments.clear();
     state.sessionId=null;
     state.sessionExported=false;
+    state.currentStateId=null;
+    state.acceptedParameters={};
+    state.transitionIds=[];
+    state.positive=null;
+    state.disposition='incomplete';
+    state.tieCandidates.clear();
     await writeHandoff(state.handoff);
     updateSource();
     await initializePlanner();
@@ -1027,6 +1483,7 @@ async function initializePlanner(){
 }
 
 (async()=>{
+  renderReviewMode();
   const origin=new URLSearchParams(location.search).get('from');
   const returnTarget=origin==='advanced'?'digitizer.html':'index.html';
   document.querySelector('#backLink').href=returnTarget;
@@ -1035,12 +1492,14 @@ async function initializePlanner(){
     state.handoff=await readHandoff();
     if(state.handoff?.training_session_id){
       state.sessionId=state.handoff.training_session_id;
-      try{
-        await cleanupTrainingSession();
-      }catch{
-        state.sessionId=null;
-        delete state.handoff.training_session_id;
-      }
+      state.currentStateId=state.handoff.training_state?.state_id||null;
+      state.acceptedParameters={
+        ...baselineParameters(),
+        ...(state.handoff.training_state?.resolved_parameters||{}),
+      };
+      state.transitionIds=[
+        ...(state.handoff.training_state?.transition_ids||[]),
+      ];
     }
     updateSource();
     await initializePlanner();

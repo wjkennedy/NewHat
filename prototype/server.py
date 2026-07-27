@@ -11,7 +11,6 @@ import hashlib
 import re
 import shutil
 import types
-import zipfile
 from datetime import datetime, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
@@ -57,6 +56,20 @@ TRAINING_COLOR_ACCURACY = {
     "acceptable",
     "shifted",
     "incorrect",
+}
+TRAINING_SCORE_AXES = {
+    "silhouette_fidelity",
+    "detail_retention",
+    "boundary_smoothness",
+    "lettering_legibility",
+    "negative_space_integrity",
+    "coverage",
+    "stitch_family_suitability",
+    "color_fidelity",
+    "thread_economy",
+    "path_efficiency",
+    "visible_defect_severity",
+    "production_acceptability",
 }
 SAFE_IDENTIFIER = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$")
 
@@ -107,6 +120,7 @@ def create_training_session(
     extension, source_bytes = _decode_data_url(source.get("data_url", ""))
     created_at = datetime.now(timezone.utc)
     session_id = f"{created_at:%Y%m%dT%H%M%SZ}-{uuid4().hex[:12]}"
+    baseline_state_id = f"state_{uuid4().hex}"
     root = _session_path(session_id, output)
     root.mkdir(parents=True, exist_ok=False)
     source_name = Path(str(source.get("name", "source-art"))).name
@@ -122,12 +136,28 @@ def create_training_session(
         },
         "settings": settings,
         "origin": payload.get("origin"),
+        "rights": (
+            payload.get("rights")
+            if isinstance(payload.get("rights"), dict) else {}
+        ),
+        "production_context": (
+            payload.get("production_context")
+            if isinstance(payload.get("production_context"), dict) else {}
+        ),
+        "baseline_state_id": baseline_state_id,
+        "baseline_resolved_parameters": payload.get(
+            "baseline_resolved_parameters", {}
+        ),
         "experiments": {},
     }
     _write_json(root / "session.json", manifest)
     return {
         "session_id": session_id,
         "created_at": manifest["created_at"],
+        "baseline_state_id": baseline_state_id,
+        "baseline_resolved_parameters": manifest[
+            "baseline_resolved_parameters"
+        ],
     }
 
 
@@ -190,7 +220,12 @@ def save_training_experiment(
             "candidate_id": candidate_id,
             "value": candidate.get("value"),
             "parameters": candidate.get("parameters", {}),
+            "action_delta": candidate.get("action_delta", {}),
+            "resolved_parameters": candidate.get(
+                "resolved_parameters", {}
+            ),
             "metrics": candidate.get("metrics", {}),
+            "generation": candidate.get("generation", {}),
         })
         _write_json(candidate_root / "plan.json", plan)
         operations = plan.get("operations", [])
@@ -223,6 +258,11 @@ def save_training_experiment(
         "phase": phase,
         "parameter": parameter,
         "reference": experiment.get("reference"),
+        "parent_state_id": experiment.get("parent_state_id"),
+        "parent_resolved_parameters": experiment.get(
+            "parent_resolved_parameters", {}
+        ),
+        "random_seed": experiment.get("random_seed", 0),
         "saved_at": datetime.now(timezone.utc).isoformat(),
         "candidates": candidate_summaries,
         "review": review if isinstance(review, dict) else None,
@@ -243,18 +283,18 @@ def save_training_experiment(
 def export_training_session(
     session_id: str, output: Path = TRAINING_SESSION_ROOT
 ) -> tuple[bytes, str]:
-    """Build an in-memory archive without clearing the retryable session."""
+    """Compile a validated v2 bundle without clearing the retryable session."""
     root = _session_path(session_id, output)
     if not (root / "session.json").exists():
         raise ValueError("Training session was not found or was already cleared")
-    archive = io.BytesIO()
-    with zipfile.ZipFile(
-        archive, "w", compression=zipfile.ZIP_DEFLATED
-    ) as bundle:
-        for path in sorted(root.rglob("*")):
-            if path.is_file():
-                bundle.write(path, path.relative_to(root))
-    return archive.getvalue(), f"training-session-{session_id}.zip"
+    from training_bundle import compile_training_bundle
+    archive, filename, _ = compile_training_bundle(
+        root,
+        as_dst=as_dst,
+        inspect_dst=inspect_dst,
+        project_root=ROOT.parent,
+    )
+    return archive, filename
 
 
 def delete_training_session(
@@ -280,12 +320,27 @@ def _training_signal_fingerprint(payload: dict) -> str:
             "positive_candidate_id": reinforcement.get(
                 "positive_candidate_id"
             ),
+            "tie_candidate_ids": sorted(
+                reinforcement.get("tie_candidate_ids", [])
+            ),
             "negative_candidate_ids": sorted(
                 reinforcement.get("negative_candidate_ids", [])
             ),
             "reasons": sorted(reinforcement.get("reasons", [])),
             "color_accuracy": reinforcement.get("color_accuracy"),
             "note": str(reinforcement.get("note", "")).strip(),
+            "reviewed_candidate_ids": sorted(
+                reinforcement.get("reviewed_candidate_ids", [])
+            ),
+            "completion_state": reinforcement.get("completion_state"),
+            "disposition": reinforcement.get("disposition"),
+            "ranking": reinforcement.get("ranking", []),
+            "candidate_scores": reinforcement.get("candidate_scores", {}),
+            "candidate_defects": reinforcement.get(
+                "candidate_defects", {}
+            ),
+            "review_ui_version": reinforcement.get("review_ui_version"),
+            "rubric_version": reinforcement.get("rubric_version"),
         },
     }
     encoded = json.dumps(
@@ -332,6 +387,15 @@ def save_training_feedback(
     if len(candidate_ids) != len(candidates):
         raise ValueError("Candidate identifiers must be present and unique")
     positive = str(reinforcement.get("positive_candidate_id", ""))
+    disposition = str(
+        reinforcement.get(
+            "disposition", "winner" if positive else "incomplete"
+        )
+    )
+    tie_candidate_ids = {
+        str(identifier)
+        for identifier in reinforcement.get("tie_candidate_ids", [])
+    }
     negatives = {
         str(identifier)
         for identifier in reinforcement.get("negative_candidate_ids", [])
@@ -340,9 +404,32 @@ def save_training_feedback(
         str(reason) for reason in reinforcement.get("reasons", [])
     }
     color_accuracy = str(reinforcement.get("color_accuracy", ""))
-    if positive not in candidate_ids:
-        raise ValueError("The positive candidate is not in this comparison")
-    if positive in negatives or not negatives.issubset(candidate_ids):
+    if disposition not in {
+        "winner", "tie", "no_acceptable_candidate", "incomplete",
+    }:
+        raise ValueError("Review disposition is invalid")
+    if disposition == "winner":
+        if positive not in candidate_ids:
+            raise ValueError(
+                "The positive candidate is not in this comparison"
+            )
+        if tie_candidate_ids:
+            raise ValueError("A winner review cannot also record a tie")
+    elif disposition == "tie":
+        if positive or len(tie_candidate_ids) < 2:
+            raise ValueError("A tie requires at least two tied candidates")
+        if not tie_candidate_ids.issubset(candidate_ids):
+            raise ValueError("Tied candidate selection is invalid")
+    elif disposition == "no_acceptable_candidate":
+        if positive or tie_candidate_ids:
+            raise ValueError(
+                "A rejected comparison cannot select a winner or tie"
+            )
+    if (
+        (positive and positive in negatives)
+        or tie_candidate_ids.intersection(negatives)
+        or not negatives.issubset(candidate_ids)
+    ):
         raise ValueError("Negative candidate selection is invalid")
     if not reasons or not reasons.issubset(TRAINING_REASONS):
         raise ValueError("At least one supported reinforcement reason is required")
@@ -351,31 +438,82 @@ def save_training_feedback(
     note = str(reinforcement.get("note", "")).strip()
     if len(note) > 2000:
         raise ValueError("Reviewer note exceeds 2,000 characters")
+    completion_state = str(
+        reinforcement.get("completion_state", "partial")
+    )
+    reviewed_candidate_ids = {
+        str(identifier) for identifier in reinforcement.get(
+            "reviewed_candidate_ids", []
+        )
+    }
+    ranking = [
+        str(identifier) for identifier in reinforcement.get("ranking", [])
+    ]
+    candidate_scores = reinforcement.get("candidate_scores", {})
+    if completion_state not in {"partial", "complete"}:
+        raise ValueError("Review completion state is invalid")
+    if not reviewed_candidate_ids.issubset(candidate_ids):
+        raise ValueError("Reviewed candidate selection is invalid")
+    if completion_state == "complete":
+        if disposition == "incomplete":
+            raise ValueError(
+                "A complete review requires an explicit disposition"
+            )
+        if reviewed_candidate_ids != candidate_ids:
+            raise ValueError(
+                "A complete review must inspect every candidate"
+            )
+        if set(ranking) != candidate_ids or len(ranking) != len(candidate_ids):
+            raise ValueError(
+                "A complete review requires one full unique ranking"
+            )
+        for candidate_id in candidate_ids:
+            scores = candidate_scores.get(candidate_id, {})
+            if set(scores) != TRAINING_SCORE_AXES or any(
+                not isinstance(value, int) or not 1 <= value <= 5
+                for value in scores.values()
+            ):
+                raise ValueError(
+                    "A complete review requires anchored 1–5 axis scores"
+                )
 
     candidates_by_id = {
         str(candidate["candidate_id"]): candidate for candidate in candidates
     }
-    positive_candidate = candidates_by_id[positive]
+    preferred_ids = (
+        [positive] if disposition == "winner"
+        else sorted(tie_candidate_ids) if disposition == "tie"
+        else []
+    )
     preference_pairs = [
         {
             "phase": phase,
             "parameter": parameter,
-            "preferred": positive_candidate,
+            "preferred": candidates_by_id[preferred],
             "rejected": candidates_by_id[negative],
             "reasons": sorted(reasons),
             "color_accuracy": color_accuracy,
         }
+        for preferred in preferred_ids
         for negative in sorted(negatives)
     ]
     learning_target = {
         "phase": phase,
         "parameter": parameter,
-        "preferred_candidate_id": positive,
-        "preferred_value": positive_candidate.get("value"),
-        "preferred_parameters": positive_candidate.get("parameters", {}),
-        "preferred_metrics": positive_candidate.get("metrics", {}),
+        "disposition": disposition,
+        "preferred_candidate_ids": preferred_ids,
     }
-    if phase == "separation":
+    if disposition == "winner":
+        positive_candidate = candidates_by_id[positive]
+        learning_target.update({
+            "preferred_candidate_id": positive,
+            "preferred_value": positive_candidate.get("value"),
+            "preferred_parameters": positive_candidate.get(
+                "parameters", {}
+            ),
+            "preferred_metrics": positive_candidate.get("metrics", {}),
+        })
+    if phase == "separation" and disposition == "winner":
         metrics = positive_candidate.get("metrics", {})
         learning_target["posterization_target"] = {
             key: metrics.get(key)
