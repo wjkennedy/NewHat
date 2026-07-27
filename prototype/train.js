@@ -167,7 +167,16 @@ function updateSource(){
 async function requestJson(url,body){
   const response=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
   if(!response.ok){
-    const error=Error((await response.text())||'Planner request failed');
+    const responseText=await response.text();
+    let message=responseText||'Planner request failed';
+    if(/<html[\s>]/i.test(responseText)){
+      const errorPage=new DOMParser().parseFromString(responseText,'text/html');
+      const detail=[...errorPage.querySelectorAll('p')]
+        .map(item=>item.textContent.trim())
+        .find(item=>item.startsWith('Message:'));
+      if(detail)message=detail.replace(/^Message:\s*/,'');
+    }
+    const error=Error(message);
     error.status=response.status;
     throw error;
   }
@@ -844,6 +853,11 @@ async function saveSignal(){
   button.textContent='Saving…';
   status.textContent='';
   try{
+    const experiment=state.experiments.get(state.parameter);
+    if(experiment){
+      experiment.review=currentReview();
+      await persistExperiment(state.parameter);
+    }
     const payload={
       schema_version:1,
       training_session_id:state.sessionId,
@@ -876,7 +890,6 @@ async function saveSignal(){
       },
     };
     const result=await requestJson('/api/training/feedback',payload);
-    const experiment=state.experiments.get(state.parameter);
     if(experiment){
       experiment.review={
         ...currentReview(),

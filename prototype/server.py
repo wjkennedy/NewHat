@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import io
+import importlib
 import json
 import sys
 import base64
+import hashlib
 import re
 import shutil
+import types
 import zipfile
 from datetime import datetime, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -20,6 +23,8 @@ ARTIFACTS_ROOT = ROOT.parent / "artifacts"
 BRACKET_ARTIFACTS = ARTIFACTS_ROOT / "bracket-fixtures"
 TRAINING_FEEDBACK_ROOT = ARTIFACTS_ROOT / "training-feedback"
 TRAINING_SESSION_ROOT = ARTIFACTS_ROOT / "training-sessions-tmp"
+DST_CODEC_ROOT = ROOT.parent / "pystitch" / "src" / "pystitch"
+DST_CODEC_PACKAGE = "_newhat_pystitch_codec"
 sys.path.insert(0, str(ROOT.parent / "pystitch" / "src"))
 
 TRAINING_PARAMETERS = {
@@ -263,6 +268,34 @@ def delete_training_session(
     return True
 
 
+def _training_signal_fingerprint(payload: dict) -> str:
+    reinforcement = payload.get("reinforcement", {})
+    canonical = {
+        "schema_version": payload.get("schema_version"),
+        "training_session_id": payload.get("training_session_id"),
+        "source": payload.get("source"),
+        "context": payload.get("context"),
+        "comparison": payload.get("comparison"),
+        "reinforcement": {
+            "positive_candidate_id": reinforcement.get(
+                "positive_candidate_id"
+            ),
+            "negative_candidate_ids": sorted(
+                reinforcement.get("negative_candidate_ids", [])
+            ),
+            "reasons": sorted(reinforcement.get("reasons", [])),
+            "color_accuracy": reinforcement.get("color_accuracy"),
+            "note": str(reinforcement.get("note", "")).strip(),
+        },
+    }
+    encoded = json.dumps(
+        canonical,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def save_training_feedback(
     payload: dict, output: Path = TRAINING_FEEDBACK_ROOT
 ) -> dict:
@@ -356,12 +389,32 @@ def save_training_feedback(
             )
         }
 
+    signal_fingerprint = _training_signal_fingerprint(payload)
+    output.mkdir(parents=True, exist_ok=True)
+    for existing_path in output.glob("*.json"):
+        try:
+            existing = json.loads(existing_path.read_text())
+        except (OSError, ValueError):
+            continue
+        existing_fingerprint = (
+            existing.get("signal_fingerprint")
+            or _training_signal_fingerprint(existing)
+        )
+        if existing_fingerprint == signal_fingerprint:
+            return {
+                "record_id": existing["record_id"],
+                "saved_at": existing["saved_at"],
+                "record": str(existing_path),
+                "duplicate": True,
+            }
+
     saved_at = datetime.now(timezone.utc)
     record_id = f"{saved_at:%Y%m%dT%H%M%SZ}-{uuid4().hex[:12]}"
     record = {
         **payload,
         "record_id": record_id,
         "saved_at": saved_at.isoformat(),
+        "signal_fingerprint": signal_fingerprint,
         "learning_target": learning_target,
         "preference_pairs": preference_pairs,
         "reinforcement": {
@@ -373,7 +426,6 @@ def save_training_feedback(
             "note": note,
         },
     }
-    output.mkdir(parents=True, exist_ok=True)
     destination = output / f"{record_id}.json"
     temporary = output / f".{record_id}.tmp"
     temporary.write_text(json.dumps(record, indent=2) + "\n")
@@ -382,12 +434,14 @@ def save_training_feedback(
         "record_id": record_id,
         "saved_at": record["saved_at"],
         "record": str(destination),
+        "duplicate": False,
     }
 
 
 def as_dst(operations: list[dict]) -> bytes:
     """Compile the browser's richer operation list through the local DST codec."""
-    from pystitch import EmbPattern, write_dst
+    pattern_module, writer_module, _ = _dst_codec_modules()
+    EmbPattern = pattern_module.EmbPattern
 
     if not any(operation.get("kind") == "stitch" for operation in operations):
         raise ValueError("A DST requires at least one stitch operation")
@@ -406,17 +460,28 @@ def as_dst(operations: list[dict]) -> bytes:
             pattern.color_change()
     pattern.end()
     output = io.BytesIO()
-    write_dst(pattern, output)
+    EmbPattern.write_embroidery(writer_module, pattern, output)
     return output.getvalue()
 
 
 def inspect_dst(dst: bytes) -> list[dict]:
     """Decode exactly what DST retained, for use by the simulator."""
-    from pystitch import read_dst
-    from pystitch.EmbConstant import COLOR_CHANGE, COMMAND_MASK, END, JUMP, STITCH, TRIM
+    pattern_module, _, reader_module = _dst_codec_modules()
+    constants = importlib.import_module(
+        f"{DST_CODEC_PACKAGE}.EmbConstant"
+    )
+    COLOR_CHANGE = constants.COLOR_CHANGE
+    COMMAND_MASK = constants.COMMAND_MASK
+    END = constants.END
+    JUMP = constants.JUMP
+    STITCH = constants.STITCH
+    TRIM = constants.TRIM
 
     names = {STITCH: "stitch", JUMP: "jump", TRIM: "trim", COLOR_CHANGE: "color"}
-    pattern = read_dst(io.BytesIO(dst))
+    pattern = pattern_module.EmbPattern.read_embroidery(
+        reader_module,
+        io.BytesIO(dst),
+    )
     decoded = []
     for x, y, command in pattern.stitches:
         command &= COMMAND_MASK
@@ -425,6 +490,20 @@ def inspect_dst(dst: bytes) -> list[dict]:
         if command in names:
             decoded.append({"kind": names[command], "x": x / 10, "y": y / 10})
     return decoded
+
+
+def _dst_codec_modules():
+    """Load only the DST codec, without unrelated format dependencies."""
+    if DST_CODEC_PACKAGE not in sys.modules:
+        package = types.ModuleType(DST_CODEC_PACKAGE)
+        package.__package__ = DST_CODEC_PACKAGE
+        package.__path__ = [str(DST_CODEC_ROOT)]
+        sys.modules[DST_CODEC_PACKAGE] = package
+    return (
+        importlib.import_module(f"{DST_CODEC_PACKAGE}.EmbPattern"),
+        importlib.import_module(f"{DST_CODEC_PACKAGE}.DstWriter"),
+        importlib.import_module(f"{DST_CODEC_PACKAGE}.DstReader"),
+    )
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -535,6 +614,7 @@ class Handler(SimpleHTTPRequestHandler):
                 payload = json.dumps({
                     "record_id": saved["record_id"],
                     "saved_at": saved["saved_at"],
+                    "duplicate": saved["duplicate"],
                 }).encode()
                 self.send_response(201)
                 self.send_header("Content-Type", "application/json")
@@ -621,6 +701,8 @@ class Handler(SimpleHTTPRequestHandler):
                 return
             else:
                 dst = as_dst(json.loads(body)["operations"])
+        except (BrokenPipeError, ConnectionResetError):
+            return
         except Exception as error:
             self.send_error(400, f"Could not compile stitch plan: {error}")
             return

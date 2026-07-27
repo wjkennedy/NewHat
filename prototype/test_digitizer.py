@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 import zipfile
@@ -33,6 +34,40 @@ from tools.render_stitch_preview import render
 
 
 class DigitizerTest(unittest.TestCase):
+    def test_dst_export_does_not_require_optional_xml_writer(self):
+        script = """
+import builtins
+from server import as_dst
+
+real_import = builtins.__import__
+def without_xml(name, *args, **kwargs):
+    if name == "xml" or name.startswith("xml."):
+        raise ModuleNotFoundError(
+            "No module named 'xml'",
+            name="xml",
+        )
+    return real_import(name, *args, **kwargs)
+
+builtins.__import__ = without_xml
+dst = as_dst([
+    {"kind": "stitch", "x": 0, "y": 0},
+    {"kind": "stitch", "x": 1, "y": 1},
+    {"kind": "end", "x": 1, "y": 1},
+])
+assert len(dst) > 512
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=Path(__file__).resolve().parent,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            0,
+            result.returncode,
+            result.stderr,
+        )
+
     def test_training_workspace_is_linked_and_omits_machine_chrome(self):
         prototype_root = Path(__file__).resolve().parent
         workspace = (prototype_root / "index.html").read_text()
@@ -101,7 +136,17 @@ class DigitizerTest(unittest.TestCase):
             },
         }
         with tempfile.TemporaryDirectory() as temporary:
-            saved = save_training_feedback(payload, Path(temporary))
+            output = Path(temporary)
+            saved = save_training_feedback(payload, output)
+            saved_record = Path(saved["record"])
+            legacy_record = json.loads(saved_record.read_text())
+            legacy_record.pop("signal_fingerprint")
+            saved_record.write_text(json.dumps(legacy_record))
+            duplicate = save_training_feedback(payload, output)
+            self.assertFalse(saved["duplicate"])
+            self.assertTrue(duplicate["duplicate"])
+            self.assertEqual(saved["record_id"], duplicate["record_id"])
+            self.assertEqual(1, len(list(output.glob("*.json"))))
             record_path = Path(saved["record"])
             self.assertTrue(record_path.exists())
             record = json.loads(record_path.read_text())
