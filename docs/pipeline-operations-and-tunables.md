@@ -145,6 +145,7 @@ Pixels describe evidence; embroidery objects describe manufacturing intent.
 | Alpha threshold | Computed with Otsu when needed | Returned diagnostic |
 | Crop to foreground | Automatic | Returned diagnostic |
 | Foreground polarity override | Not available | Proposed guided control |
+| Posterization smoothing radius | 0 px production baseline; 0–2 px training bracket | API, training UI |
 | Mask cleanup strength | Purpose-specific and guarded | Engine |
 
 ### Outputs and checks
@@ -154,7 +155,11 @@ Pixels describe evidence; embroidery objects describe manufacturing intent.
 - Background reference color and tolerance when applicable.
 - Foreground color-family coverage.
 - Foreground pixel count and bounds.
-- Proposed bracket: foreground retained-area ratio before and after cleanup.
+- Boundary-cleanup bracket: source-space Gaussian smoothing at 0, 0.50, 0.85,
+  1.25, and 2 px.
+- Boundary quality metrics: perimeter, edge-turn density, connected and small
+  component counts, retained negative-space count, source-mask intersection
+  over union, and area delta.
 - Proposed overlay: accepted foreground, uncertain boundary band, and rejected
   background.
 

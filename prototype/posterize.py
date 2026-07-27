@@ -202,6 +202,121 @@ def otsu_foreground_mask(source: Image.Image) -> tuple[set[tuple[int, int]], dic
     }
 
 
+def mask_geometry_metrics(
+    mask: set[tuple[int, int]],
+    *,
+    reference: set[tuple[int, int]] | None = None,
+) -> dict:
+    """Measure raster-boundary quality without claiming visual correctness."""
+    if not mask:
+        return {
+            "foreground_pixels": 0,
+            "component_count": 0,
+            "small_component_count": 0,
+            "perimeter_px": 0,
+            "boundary_corner_count": 0,
+            "corners_per_100_boundary_px": 0.0,
+            "negative_space_count": 0,
+            "reference_iou": 0.0,
+            "area_delta_percent": 0.0,
+        }
+
+    remaining = set(mask)
+    component_sizes: list[int] = []
+    while remaining:
+        start = remaining.pop()
+        stack = [start]
+        size = 1
+        while stack:
+            x, y = stack.pop()
+            for neighbor in (
+                (x - 1, y), (x + 1, y),
+                (x, y - 1), (x, y + 1),
+            ):
+                if neighbor in remaining:
+                    remaining.remove(neighbor)
+                    stack.append(neighbor)
+                    size += 1
+        component_sizes.append(size)
+
+    perimeter = sum(
+        neighbor not in mask
+        for x, y in mask
+        for neighbor in (
+            (x - 1, y), (x + 1, y),
+            (x, y - 1), (x, y + 1),
+        )
+    )
+    min_x, max_x = min(x for x, _ in mask), max(x for x, _ in mask)
+    min_y, max_y = min(y for _, y in mask), max(y for _, y in mask)
+    corners = 0
+    for y in range(min_y - 1, max_y + 1):
+        for x in range(min_x - 1, max_x + 1):
+            occupied = sum(
+                point in mask
+                for point in (
+                    (x, y), (x + 1, y),
+                    (x, y + 1), (x + 1, y + 1),
+                )
+            )
+            if occupied in {1, 3}:
+                corners += 1
+
+    background = {
+        (x, y)
+        for y in range(min_y - 1, max_y + 2)
+        for x in range(min_x - 1, max_x + 2)
+        if (x, y) not in mask
+    }
+    outside_start = (min_x - 1, min_y - 1)
+    outside = {outside_start}
+    stack = [outside_start]
+    while stack:
+        x, y = stack.pop()
+        for neighbor in (
+            (x - 1, y), (x + 1, y),
+            (x, y - 1), (x, y + 1),
+        ):
+            if neighbor in background and neighbor not in outside:
+                outside.add(neighbor)
+                stack.append(neighbor)
+    enclosed = background - outside
+    negative_spaces = 0
+    while enclosed:
+        start = enclosed.pop()
+        stack = [start]
+        while stack:
+            x, y = stack.pop()
+            for neighbor in (
+                (x - 1, y), (x + 1, y),
+                (x, y - 1), (x, y + 1),
+            ):
+                if neighbor in enclosed:
+                    enclosed.remove(neighbor)
+                    stack.append(neighbor)
+        negative_spaces += 1
+
+    reference = reference if reference is not None else mask
+    union = mask | reference
+    intersection = mask & reference
+    return {
+        "foreground_pixels": len(mask),
+        "component_count": len(component_sizes),
+        "small_component_count": sum(size <= 4 for size in component_sizes),
+        "perimeter_px": perimeter,
+        "boundary_corner_count": corners,
+        "corners_per_100_boundary_px": round(
+            corners * 100 / max(1, perimeter), 3
+        ),
+        "negative_space_count": negative_spaces,
+        "reference_iou": round(len(intersection) / max(1, len(union)), 6),
+        "area_delta_percent": round(
+            (len(mask) - len(reference)) * 100 / max(1, len(reference)),
+            3,
+        ),
+    }
+
+
 def _significant_hue_families(
     colors: list[tuple[int, int, int]],
     *,

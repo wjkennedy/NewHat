@@ -43,6 +43,10 @@ class DigitizerTest(unittest.TestCase):
         self.assertIn("source art", training)
         self.assertIn("pipeline experiments", training)
         self.assertIn("posterized art", training)
+        self.assertIn("boundary cleanup", training_script.lower())
+        self.assertIn("boundary_smoothness", training)
+        self.assertIn("detail_retention", training)
+        self.assertIn("silhouette_fidelity", training)
         self.assertIn("bracketed sewouts", training)
         self.assertIn("training signal", training)
         self.assertNotIn("job preflight", training)
@@ -122,6 +126,62 @@ class DigitizerTest(unittest.TestCase):
                 record["training_session_id"],
             )
             self.assertEqual(1, len(record["preference_pairs"]))
+
+    def test_training_feedback_retains_posterization_geometry_target(self):
+        geometry = {
+            "corners_per_100_boundary_px": 55.2,
+            "negative_space_count": 4,
+            "reference_iou": 0.986,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            saved = save_training_feedback({
+                "schema_version": 1,
+                "source": {
+                    "name": "rough-mark.png",
+                    "sha256": "c" * 64,
+                },
+                "context": {"width_mm": 72, "colors": 2},
+                "comparison": {
+                    "phase": "separation",
+                    "parameter": "posterization_smoothing",
+                    "candidates": [
+                        {
+                            "candidate_id": "posterization_smoothing-none",
+                            "value": "none",
+                            "metrics": {"geometry_quality": {}},
+                        },
+                        {
+                            "candidate_id": "posterization_smoothing-balanced",
+                            "value": "balanced",
+                            "parameters": {
+                                "posterization_smoothing_px": 0.85,
+                            },
+                            "metrics": {"geometry_quality": geometry},
+                        },
+                    ],
+                },
+                "reinforcement": {
+                    "positive_candidate_id":
+                        "posterization_smoothing-balanced",
+                    "negative_candidate_ids": [
+                        "posterization_smoothing-none",
+                    ],
+                    "reasons": [
+                        "boundary_smoothness",
+                        "detail_retention",
+                        "silhouette_fidelity",
+                    ],
+                    "color_accuracy": "accurate",
+                },
+            }, Path(temporary))
+            record = json.loads(Path(saved["record"]).read_text())
+            target = record["learning_target"]["posterization_target"]
+            self.assertEqual(geometry, target["geometry_quality"])
+            self.assertEqual(
+                0.85,
+                record["learning_target"]["preferred_parameters"]
+                ["posterization_smoothing_px"],
+            )
 
     def test_training_session_archive_remains_retryable_until_cleanup(self):
         image = Image.new("RGBA", (8, 6), (255, 255, 255, 255))
@@ -653,6 +713,45 @@ class DigitizerTest(unittest.TestCase):
         plan = digitize(stream.getvalue(), width_mm=72, colors=2)
         self.assertIn("#d22d54", plan.palette)
         self.assertTrue(any(region.color == "#d22d54" for region in plan.regions))
+
+    def test_posterization_smoothing_is_reported_and_changes_plan_geometry(self):
+        image = Image.new("RGB", (100, 70), "white")
+        draw = ImageDraw.Draw(image)
+        draw.ellipse((12, 8, 88, 62), fill="#b81438")
+        draw.ellipse((35, 24, 65, 46), fill="white")
+        for x in range(20, 81, 2):
+            draw.point((x, 7 - x % 2), fill="#b81438")
+        stream = BytesIO()
+        image.save(stream, format="PNG")
+
+        raw = digitize(
+            stream.getvalue(),
+            width_mm=72,
+            colors=2,
+            posterization_smoothing_px=0,
+            include_posterized=True,
+        )
+        smoothed = digitize(
+            stream.getvalue(),
+            width_mm=72,
+            colors=2,
+            posterization_smoothing_px=1.25,
+            include_posterized=True,
+        )
+
+        raw_quality = raw.posterization["geometry_quality"]
+        smooth_quality = smoothed.posterization["geometry_quality"]
+        self.assertEqual(1.25, smoothed.posterization["smoothing_radius_px"])
+        self.assertLess(
+            smooth_quality["small_component_count"],
+            raw_quality["small_component_count"],
+        )
+        self.assertEqual(1, smooth_quality["negative_space_count"])
+        self.assertGreater(smooth_quality["reference_iou"], 0.98)
+        self.assertNotEqual(
+            len(raw.regions),
+            len(smoothed.regions),
+        )
 
     def test_opaque_script_art_is_sized_from_foreground_not_white_canvas(self):
         image = Path(__file__).resolve().parent.parent / "bobevans.jpg"

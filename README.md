@@ -61,17 +61,22 @@ UI.
 ### Model-training workspace
 
 Choose **Train model** beside **Replace artwork** to review phase-specific
-color-separation, object/stackup, and stitch-construction brackets. Each
-experiment is generated once per browser session and remains available when
-switching between phases, so comparisons do not invoke the planner again.
+color-separation, boundary-cleanup, object/stackup, and stitch-construction
+brackets. Boundary-cleanup candidates enlarge the posterized result and compare
+source-space smoothing against edge-turn density, component noise, retained
+negative spaces, silhouette overlap, and the downstream sewout. Each experiment
+is generated once per browser session and remains available when switching
+between phases, so comparisons do not invoke the planner again.
 
 Completed experiments are staged as one temporary training session. **Export
 session** downloads a ZIP containing the source artwork, experiment manifests,
 candidate parameters and metrics, complete plans, DST files, posterized
 artwork, and virtual-sewout PNGs. The server deletes the staged session after
-the ZIP is built. Replacing artwork or explicitly discarding the session also
-removes temporary plans and sewouts. Browser navigation does not clear an
-active session because the page may remain live in the back/forward cache.
+the ZIP is delivered successfully and preserves it when delivery is interrupted
+so the export can be retried. Replacing artwork or explicitly discarding the
+session also removes temporary plans and sewouts. Browser navigation does not
+clear an active session because the page may remain live in the back/forward
+cache.
 
 ## Digitizing API
 
@@ -88,6 +93,7 @@ All endpoints are local and accept JSON unless noted otherwise.
   "colors": 6,
   "profile": "structured_cap",
   "density_multiplier": 1.0,
+  "posterization_smoothing_px": 0.85,
   "limits": {
     "max_objects": 400,
     "max_trims": 120,
@@ -105,6 +111,10 @@ and is clamped to `0.6`–`1.5`. It changes visible blocking density without
 removing source geometry. `limits` optionally overrides object, structural
 trim, detail-trim, and jump ceilings. Absolute and per-1,000-stitch limits are
 both applied; the lower resolved value is reported by DRC.
+`posterization_smoothing_px` is optional, defaults to `0`, and is clamped to
+`0`–`3`. It smooths the geometry-analysis raster before foreground extraction
+and vectorization while preserving the unsmoothed source for the independent
+detail scan.
 
 The response contains a semantic plan:
 

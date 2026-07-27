@@ -12,11 +12,12 @@ from io import BytesIO
 from math import ceil, cos, floor, hypot, radians, sin
 from typing import Iterable
 
-from PIL import Image
+from PIL import Image, ImageFilter
 from posterize import (
     analyze_pass_filters,
     detail_edge_response,
     filter_blocking_mask,
+    mask_geometry_metrics,
     otsu_foreground_mask,
     quantize_foreground,
 )
@@ -1374,6 +1375,7 @@ def digitize(
     density_multiplier: float = 1.0,
     color_merge_tolerance: float = 8.0,
     fragmented_color_threshold: float = 0.20,
+    posterization_smoothing_px: float = 0.0,
     construction_mode: str = "auto",
     running_passes: int = 3,
     include_posterized: bool = False,
@@ -1388,6 +1390,9 @@ def digitize(
     except KeyError as error:
         raise ValueError(f"unknown digitizing algorithm: {algorithm}") from error
     density_multiplier = max(0.6, min(1.5, float(density_multiplier)))
+    posterization_smoothing_px = max(
+        0.0, min(3.0, float(posterization_smoothing_px))
+    )
     if construction_mode not in {"auto", "tatami", "multi_run"}:
         raise ValueError(f"unknown construction mode: {construction_mode}")
     running_passes = max(1, min(5, int(running_passes)))
@@ -1419,9 +1424,21 @@ def digitize(
         (1024, 1024),
         Image.Resampling.NEAREST if block_art else Image.Resampling.LANCZOS,
     )
-    foreground, posterization = otsu_foreground_mask(source)
+    detail_source = source.copy()
+    reference_foreground, _ = otsu_foreground_mask(source)
+    geometry_source = (
+        source.filter(ImageFilter.GaussianBlur(posterization_smoothing_px))
+        if posterization_smoothing_px > 0
+        else source
+    )
+    foreground, posterization = otsu_foreground_mask(geometry_source)
+    posterization["smoothing_radius_px"] = posterization_smoothing_px
+    posterization["geometry_quality"] = mask_geometry_metrics(
+        foreground,
+        reference=reference_foreground,
+    )
     if not foreground:
-        width, height = source.size
+        width, height = geometry_source.size
         physical_scale = min(width_mm / width, 55.0 / height)
         return StitchPlan(
             "2.0", width * physical_scale, height * physical_scale,
@@ -1434,36 +1451,64 @@ def digitize(
     min_x, max_x = min(x for x, _ in foreground), max(x for x, _ in foreground)
     min_y, max_y = min(y for _, y in foreground), max(y for _, y in foreground)
     posterization["source_size_px"] = {
-        "width": source.width, "height": source.height,
+        "width": geometry_source.width, "height": geometry_source.height,
     }
     posterization["foreground_bounds_px"] = {
         "left": min_x, "top": min_y, "right": max_x, "bottom": max_y,
     }
     if (min_x, min_y, max_x, max_y) != (
-        0, 0, source.width - 1, source.height - 1
+        0, 0, geometry_source.width - 1, geometry_source.height - 1
     ):
-        source = source.crop((min_x, min_y, max_x + 1, max_y + 1))
+        geometry_source = geometry_source.crop(
+            (min_x, min_y, max_x + 1, max_y + 1)
+        )
+        detail_source = detail_source.crop(
+            (min_x, min_y, max_x + 1, max_y + 1)
+        )
         foreground = {
             (x - min_x, y - min_y) for x, y in foreground
+        }
+        reference_foreground = {
+            (x - min_x, y - min_y)
+            for x, y in reference_foreground
+            if min_x <= x <= max_x and min_y <= y <= max_y
         }
         posterization["cropped_to_foreground"] = True
     else:
         posterization["cropped_to_foreground"] = False
-    width, height = source.size
+    width, height = geometry_source.size
     physical_scale = min(width_mm / width, 55.0 / height)
     width_mm = width * physical_scale
     height_mm = height * physical_scale
     pixel_scale = min(width_mm / width, height_mm / height)
     pixel_area_mm2 = (width_mm / width) * (height_mm / height)
     separation_diagnostics: dict = {}
+    color_sampling_mask = foreground & reference_foreground
     palette, assigned, selected = quantize_foreground(
-        source,
-        foreground,
+        # Geometry smoothing must not manufacture new thread shades. Sample
+        # color from the unsmoothed artwork inside the cleaned silhouette.
+        detail_source,
+        color_sampling_mask or foreground,
         colors,
         merge_tolerance=color_merge_tolerance,
         fragmented_merge_threshold=fragmented_color_threshold,
         diagnostics=separation_diagnostics,
     )
+    if assigned and len(assigned) < len(foreground):
+        queue = deque(assigned)
+        while queue:
+            point = queue.popleft()
+            x, y = point
+            for neighbor in (
+                (x - 1, y), (x + 1, y),
+                (x, y - 1), (x, y + 1),
+            ):
+                if neighbor in foreground and neighbor not in assigned:
+                    assigned[neighbor] = assigned[point]
+                    queue.append(neighbor)
+        fallback_color = selected[0]
+        for point in foreground:
+            assigned.setdefault(point, fallback_color)
     posterization["requested_color_limit"] = colors
     posterization["color_separation"] = separation_diagnostics
     posterization["semantic_color_count"] = len(selected)
@@ -1476,7 +1521,7 @@ def digitize(
     posterization["construction_mode"] = construction_mode
     posterization["running_passes"] = running_passes
     if include_posterized:
-        preview = Image.new("RGBA", source.size, (0, 0, 0, 0))
+        preview = Image.new("RGBA", geometry_source.size, (0, 0, 0, 0))
         preview_pixels = preview.load()
         for point, color_index in assigned.items():
             preview_pixels[point[0], point[1]] = (
@@ -1493,7 +1538,9 @@ def digitize(
         and width / max(1, height) >= 3.0
         and not block_art
     )
-    shared_detail_response = None if block_art else detail_edge_response(source)
+    shared_detail_response = (
+        None if block_art else detail_edge_response(detail_source)
+    )
 
     # Pass 1: geometry components and their interior thread layers. Geometry
     # identity is established before color subdivision.
@@ -1506,7 +1553,7 @@ def digitize(
     for element_number, element in enumerate(elements, 1):
         element_id = f"element-{element_number}"
         filter_report, pass_masks = analyze_pass_filters(
-            source,
+            detail_source,
             element,
             assigned,
             pixel_scale=pixel_scale,
@@ -1982,7 +2029,11 @@ def digitize_payload(image_bytes: bytes, **arguments) -> dict:
     from vectorize import vectorize_posterized
 
     document = vectorize_posterized(
-        image_bytes, width_mm=float(arguments.get("width_mm", 72))
+        image_bytes,
+        width_mm=float(arguments.get("width_mm", 72)),
+        smoothing_radius_px=float(
+            arguments.get("posterization_smoothing_px", 0.0)
+        ),
     )
     satin_objects = [
         item for item in document.objects

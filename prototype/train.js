@@ -40,6 +40,21 @@ const PARAMETERS={
     ],
     applies:()=>true,
   },
+  posterization_smoothing:{
+    phase:'separation',
+    label:'Boundary cleanup',
+    short:'Smoothing radius',
+    reference:'0–2 px source-space Gaussian',
+    copy:'Brackets silhouette smoothing before vectorization. Prefer the least smoothing that removes raster chatter while retaining counters, corners, stroke weight, and small authored details.',
+    values:[
+      {id:'none',label:'None · 0 px',smoothing:0,baseline:true},
+      {id:'light',label:'Light · 0.50 px',smoothing:.5},
+      {id:'balanced',label:'Balanced · 0.85 px',smoothing:.85},
+      {id:'smooth',label:'Smooth · 1.25 px',smoothing:1.25},
+      {id:'strong',label:'Strong · 2.00 px',smoothing:2},
+    ],
+    applies:()=>true,
+  },
   stitch_family:{
     phase:'interpretation',
     label:'Stitch-family stack',
@@ -194,6 +209,7 @@ function candidateParameters(candidate){
   return {
     color_merge_tolerance:candidate.option.merge,
     fragmented_color_threshold:candidate.option.fragmented,
+    posterization_smoothing_px:candidate.option.smoothing,
     construction_mode:candidate.option.mode,
     density_multiplier:candidate.parameter==='tatami_density'?candidate.option.value:undefined,
     running_passes:candidate.parameter==='running_passes'||candidate.parameter==='stitch_family'?candidate.option.passes:undefined,
@@ -214,6 +230,7 @@ function candidateMetricRecord(candidate){
     quantized_color_count:candidate.metrics.separation.quantized_color_count,
     merged_shade_count:candidate.metrics.separation.merged_shade_count,
     mean_color_error_rgb:candidate.metrics.separation.mean_color_error_rgb,
+    geometry_quality:candidate.metrics.geometry,
     stitch_types:candidate.metrics.stitchTypes,
     object_count:candidate.metrics.objects,
   };
@@ -272,6 +289,7 @@ function rasterRequest(overrides={}){
     density_multiplier:settings.density_multiplier,
     color_merge_tolerance:8,
     fragmented_color_threshold:.20,
+    posterization_smoothing_px:0,
     include_posterized:true,
     ...overrides,
   };
@@ -322,6 +340,12 @@ function renderParameters(){
     container.append(button);
   });
   const parameter=PARAMETERS[state.parameter];
+  const phase=parameter?.phase||'construction';
+  const review=document.querySelector('.review');
+  review.dataset.phase=phase;
+  document.querySelector('#bracketKind').textContent=(
+    phase==='separation'?'BRACKETED POSTERIZATIONS':'BRACKETED SEWOUTS'
+  );
   document.querySelector('#referenceRange').textContent=parameter?.reference||'—';
   document.querySelector('#referenceCopy').textContent=parameter?.copy||'The bracket keeps every other planner input fixed.';
   document.querySelector('#bracketTitle').textContent=parameter?`${PHASES[parameter.phase]} · ${parameter.label}`:'Controlled comparison';
@@ -346,6 +370,11 @@ async function buildCandidate(parameter,option,index){
     payload=await requestJson('/api/digitize',rasterRequest({
       color_merge_tolerance:option.merge,
       fragmented_color_threshold:option.fragmented,
+    }));
+    document=payload.document||null;
+  }else if(parameter==='posterization_smoothing'){
+    payload=await requestJson('/api/digitize',rasterRequest({
+      posterization_smoothing_px:option.smoothing,
     }));
     document=payload.document||null;
   }else if(parameter==='stitch_family'){
@@ -403,6 +432,7 @@ function planMetrics(candidate){
   const status=(blockers||long)?'block':warnings?'warning':'pass';
   const palette=[...new Set(candidate.payload.palette||[])];
   const separation=candidate.payload.posterization?.color_separation||{};
+  const geometry=candidate.payload.posterization?.geometry_quality||{};
   const stitchTypes=(candidate.payload.regions||[]).reduce((counts,region)=>{
     const type=region.stitch_type==='fill'?'tatami':region.stitch_type;
     counts[type]=(counts[type]||0)+1;
@@ -410,7 +440,7 @@ function planMetrics(candidate){
   },{});
   return {
     stitches,trims,jumps,brackets,blockers,warnings,long,status,palette,
-    separation,stitchTypes,objects:(candidate.payload.regions||[]).length,
+    separation,geometry,stitchTypes,objects:(candidate.payload.regions||[]).length,
   };
 }
 
@@ -422,6 +452,11 @@ function candidateFingerprint(candidate){
       hash=Math.imul(hash,16777619);
     }
   };
+  if(candidate.phase==='separation'){
+    update(candidate.parameter);
+    update(candidate.option.id);
+    update(candidate.payload.posterization?.preview_data_url||'');
+  }
   (candidate.payload.palette||[]).forEach(update);
   (candidate.payload.operations||[]).forEach(operation=>{
     update(operation.kind);
@@ -499,6 +534,10 @@ function evidenceText(metrics){
 }
 
 function phaseEvidence(candidate,metrics){
+  if(candidate.parameter==='posterization_smoothing'){
+    const geometry=metrics.geometry;
+    return `${Number(geometry.corners_per_100_boundary_px||0).toFixed(1)} edge turns / 100 px · ${geometry.component_count||0} components · ${geometry.small_component_count||0} specks · ${geometry.negative_space_count||0} retained negative spaces · ${(Number(geometry.reference_iou||0)*100).toFixed(1)}% silhouette overlap`;
+  }
   if(candidate.phase==='separation'){
     return `${metrics.separation.quantized_color_count??metrics.palette.length} quantized shades → ${metrics.palette.length} thread color${metrics.palette.length===1?'':'s'} · ${metrics.separation.merged_shade_count||0} merged · mean RGB error ${Number(metrics.separation.mean_color_error_rgb||0).toFixed(1)}`;
   }
@@ -515,6 +554,14 @@ function metricMarkup(candidate,metrics){
     ['Objects',metrics.objects.toLocaleString()],
   ];
   if(candidate.phase==='separation'){
+    if(candidate.parameter==='posterization_smoothing'){
+      return [
+        ['Edge turns / 100 px',Number(metrics.geometry.corners_per_100_boundary_px||0).toFixed(1)],
+        ['Components',String(metrics.geometry.component_count||0)],
+        ['Negative spaces',String(metrics.geometry.negative_space_count||0)],
+        ['Silhouette overlap',`${(Number(metrics.geometry.reference_iou||0)*100).toFixed(1)}%`],
+      ];
+    }
     return [
       ...common,
       ['Threads',metrics.palette.length.toLocaleString()],
@@ -538,6 +585,10 @@ function renderCandidate(candidate){
   fragment.querySelector('.candidate-parameter b').textContent=candidate.option.label;
   const posterized=fragment.querySelector('.posterized-frame img');
   posterized.src=candidate.payload.posterization?.preview_data_url||state.handoff.source.data_url;
+  if(candidate.phase==='separation'){
+    fragment.querySelector('.posterized-frame>span').textContent='POSTERIZED CANDIDATE';
+    fragment.querySelector('.sewout-frame .visual-label').textContent='DOWNSTREAM SEWOUT';
+  }
   const metrics=planMetrics(candidate);
   candidate.metrics=metrics;
   const paletteElement=fragment.querySelector('.candidate-palette');

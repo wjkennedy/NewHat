@@ -24,6 +24,7 @@ sys.path.insert(0, str(ROOT.parent / "pystitch" / "src"))
 
 TRAINING_PARAMETERS = {
     "color_separation",
+    "posterization_smoothing",
     "stitch_family",
     "tatami_density",
     "running_passes",
@@ -35,9 +36,12 @@ TRAINING_PARAMETERS = {
 }
 TRAINING_PHASES = {"separation", "interpretation", "construction"}
 TRAINING_REASONS = {
+    "boundary_smoothness",
     "negative_space",
     "curve_flow",
+    "detail_retention",
     "edge_quality",
+    "silhouette_fidelity",
     "coverage",
     "color_accuracy",
     "thread_economy",
@@ -348,6 +352,7 @@ def save_training_feedback(
                 "quantized_color_count",
                 "merged_shade_count",
                 "mean_color_error_rgb",
+                "geometry_quality",
             )
         }
 
@@ -554,6 +559,9 @@ class Handler(SimpleHTTPRequestHandler):
                     ),
                     "fragmented_color_threshold": float(
                         request.get("fragmented_color_threshold", 0.20)
+                    ),
+                    "posterization_smoothing_px": float(
+                        request.get("posterization_smoothing_px", 0.0)
                     ),
                     "construction_mode": str(
                         request.get("construction_mode", "auto")

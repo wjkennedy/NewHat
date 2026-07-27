@@ -35,6 +35,12 @@ def payload(**drc_overrides):
         "posterization": {
             "selected_planner": "raster_layered",
             "construction_mode": "tatami",
+            "smoothing_radius_px": 0.85,
+            "geometry_quality": {
+                "corners_per_100_boundary_px": 42.0,
+                "negative_space_count": 2,
+                "reference_iou": 0.97,
+            },
             "color_separation": {
                 "merge_tolerance_rgb": 8,
                 "semantic_color_count": 1,
@@ -80,6 +86,15 @@ class DrcTrainingTests(unittest.TestCase):
         self.assertEqual(
             "tatami",
             training_record["proposal"]["construction_mode"],
+        )
+        self.assertEqual(
+            0.85,
+            training_record["proposal"]["posterization_smoothing_px"],
+        )
+        self.assertEqual(
+            2,
+            training_record["features"]["artwork_observations"]
+            ["geometry_quality"]["negative_space_count"],
         )
 
     def test_drc_policy_distinguishes_pass_review_and_block(self):

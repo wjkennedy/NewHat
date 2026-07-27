@@ -1,11 +1,12 @@
 import unittest
 from pathlib import Path
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter
 
 from posterize import (
     analyze_pass_filters,
     detail_foreground_mask,
+    mask_geometry_metrics,
     otsu_foreground_mask,
     otsu_threshold,
     quantize_foreground,
@@ -48,6 +49,31 @@ class PosterizeTest(unittest.TestCase):
         mask, _ = otsu_foreground_mask(image)
         self.assertIn((12, 25), mask)
         self.assertNotIn((35, 25), mask)
+
+    def test_geometry_metrics_expose_smoothing_without_hiding_counter_loss(self):
+        image = Image.new("RGB", (100, 70), "white")
+        draw = ImageDraw.Draw(image)
+        draw.ellipse((12, 8, 88, 62), fill="#b81438")
+        draw.ellipse((35, 24, 65, 46), fill="white")
+        for x in range(20, 81, 2):
+            draw.point((x, 7 - x % 2), fill="#b81438")
+        raw, _ = otsu_foreground_mask(image)
+        smoothed, _ = otsu_foreground_mask(
+            image.filter(ImageFilter.GaussianBlur(1.25))
+        )
+        raw_metrics = mask_geometry_metrics(raw)
+        smooth_metrics = mask_geometry_metrics(
+            smoothed,
+            reference=raw,
+        )
+        self.assertGreater(raw_metrics["small_component_count"], 0)
+        self.assertEqual(0, smooth_metrics["small_component_count"])
+        self.assertLess(
+            smooth_metrics["corners_per_100_boundary_px"],
+            raw_metrics["corners_per_100_boundary_px"],
+        )
+        self.assertEqual(1, smooth_metrics["negative_space_count"])
+        self.assertGreater(smooth_metrics["reference_iou"], 0.98)
 
     def test_transparency_is_the_geometry_contract(self):
         image = Image.new("RGBA", (30, 20), (245, 245, 245, 0))
