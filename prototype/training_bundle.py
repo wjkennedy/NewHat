@@ -1664,6 +1664,7 @@ def compile_training_bundle(
     proposal_paths = []
     candidate_paths = []
     pipeline_paths = []
+    dst_deliverable_paths = []
     comparison_paths = []
     review_paths = []
     reward_paths = []
@@ -1808,6 +1809,16 @@ def compile_training_bundle(
                     ) if decoded else None
                 ),
             }
+            dst_deliverable_path = None
+            if dst:
+                dst_deliverable_path = (
+                    f"deliverables/dst/{parameter}/{display_name}.dst"
+                )
+                files.add_bytes(dst_deliverable_path, dst)
+                dst_deliverable_paths.append(dst_deliverable_path)
+                artifact_refs["dst"]["portable_path"] = (
+                    dst_deliverable_path
+                )
             for filename, key, media_type in (
                 ("posterized.png", "posterized", "image/png"),
                 ("sewout.png", "virtual_sewout", "image/png"),
@@ -2023,6 +2034,7 @@ def compile_training_bundle(
                 "layers_path": f"candidates/{candidate_id}/layers.json",
                 "metrics_path": f"candidates/{candidate_id}/metrics.json",
                 "drc_path": f"candidates/{candidate_id}/drc.json",
+                "dst_path": dst_deliverable_path,
             }
             candidate_dir = f"candidates/{candidate_id}"
             pipeline_paths.append(
@@ -2486,6 +2498,7 @@ def compile_training_bundle(
             "proposals": proposal_paths,
             "candidates": candidate_paths,
             "pipelines": pipeline_paths,
+            "dst_deliverables": dst_deliverable_paths,
             "effective_candidates": effective_paths,
             "comparisons": comparison_paths,
             "reviews": review_paths,
@@ -2513,6 +2526,7 @@ def compile_training_bundle(
                 for item in review_records
             ),
             "transitions": len(transition_paths),
+            "dst_deliverables": len(dst_deliverable_paths),
             "content_objects": len([
                 path for path in files.files
                 if path.startswith("objects/sha256/")
@@ -2521,6 +2535,16 @@ def compile_training_bundle(
     }
     for name, schema in SCHEMAS.items():
         files.add_json(f"schemas/{name}", schema)
+    files.add_bytes(
+        "deliverables/README.md",
+        (
+            "# Candidate embroidery files\n\n"
+            "The `dst` directory contains one directly usable `.dst` file "
+            "for every generated candidate, grouped by experiment. "
+            "Each file is checksummed and its canonical content-addressed "
+            "object is recorded in the candidate's `artifact-refs.json`.\n"
+        ).encode(),
+    )
     files.add_json("manifest.json", manifest)
     findings = _validate_bundle(files, manifest)
     if findings:

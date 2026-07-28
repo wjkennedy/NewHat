@@ -401,6 +401,11 @@ if (redOnly.some(operation => operation.kind === "color")) {
                 artifacts = json.loads(bundle.read(
                     f"{candidate_root}/artifact-refs.json"
                 ))["artifacts"]
+                dst_deliverables = manifest["indexes"][
+                    "dst_deliverables"
+                ]
+                canonical_dst = bundle.read(artifacts["dst"]["path"])
+                portable_dst = bundle.read(dst_deliverables[0])
                 checksums = bundle.read("checksums.sha256").decode()
                 self.assertEqual("COMPLETE", bundle.namelist()[-1])
             self.assertIn("manifest.json", names)
@@ -417,6 +422,18 @@ if (redOnly.some(operation => operation.kind === "color")) {
                 action["action_delta"],
             )
             self.assertTrue(artifacts["dst"]["path"] in names)
+            self.assertEqual(1, len(dst_deliverables))
+            self.assertTrue(dst_deliverables[0].endswith(".dst"))
+            self.assertIn(dst_deliverables[0], names)
+            self.assertEqual(
+                artifacts["dst"]["portable_path"],
+                dst_deliverables[0],
+            )
+            self.assertEqual(
+                canonical_dst,
+                portable_dst,
+            )
+            self.assertIn("deliverables/README.md", names)
             self.assertTrue(
                 artifacts["decoded_stream"]["path"] in names
             )
