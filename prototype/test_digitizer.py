@@ -298,6 +298,23 @@ assert len(dst) > 512
                 },
             }, output)
             self.assertEqual(1, saved["experiment_count"])
+            staged_candidate = (
+                output / session_id / "experiments" / "tatami_density"
+                / "tatami_density-0.7"
+            )
+            stage_ledger = json.loads(
+                (staged_candidate / "stages.json").read_text()
+            )
+            self.assertEqual("complete", stage_ledger["status"])
+            self.assertEqual(
+                [
+                    "color_separation",
+                    "semantic_stitch_plan",
+                    "machine_expansion",
+                    "virtual_render",
+                ],
+                [stage["stage_id"] for stage in stage_ledger["stages"]],
+            )
             archive, filename = export_training_session(session_id, output)
             self.assertTrue(filename.endswith("-v2.zip"))
             self.assertTrue((output / session_id).exists())
@@ -309,6 +326,9 @@ assert len(dst) > 512
                 candidate_root = candidate_path.rsplit("/", 1)[0]
                 action = json.loads(bundle.read(
                     f"{candidate_root}/action.json"
+                ))
+                pipeline = json.loads(bundle.read(
+                    f"{candidate_root}/pipeline.json"
                 ))
                 artifacts = json.loads(bundle.read(
                     f"{candidate_root}/artifact-refs.json"
@@ -329,7 +349,22 @@ assert len(dst) > 512
                 action["action_delta"],
             )
             self.assertTrue(artifacts["dst"]["path"] in names)
+            self.assertTrue(
+                artifacts["decoded_stream"]["path"] in names
+            )
             self.assertTrue(artifacts["virtual_sewout"]["path"] in names)
+            self.assertEqual("verified", pipeline["stage_ledger_status"])
+            self.assertEqual(
+                [
+                    "source_normalization",
+                    "color_separation",
+                    "semantic_stitch_plan",
+                    "machine_expansion",
+                    "virtual_render",
+                    "round_trip_validation",
+                ],
+                [stage["stage_id"] for stage in pipeline["stages"]],
+            )
             self.assertIn("manifest.json", checksums)
             self.assertTrue(delete_training_session(session_id, output))
             self.assertFalse((output / session_id).exists())
@@ -357,6 +392,88 @@ assert len(dst) > 512
             self.assertTrue(
                 recovered_manifest["recovered_without_source"]
             )
+
+    def test_training_experiment_commit_preserves_previous_phase_on_failure(self):
+        data_url = self._training_source_data_url()
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            session = create_training_session({
+                "schema_version": 1,
+                "source": {"name": "atomic.png", "data_url": data_url},
+                "settings": {"width_mm": 72, "colors": 2},
+            }, output)
+            payload = {
+                "schema_version": 1,
+                "session_id": session["session_id"],
+                "experiment": {
+                    "phase": "construction",
+                    "parameter": "tatami_density",
+                    "candidates": [{
+                        "candidate_id": "tatami_density-1.0",
+                        "plan": {
+                            "operations": [
+                                {"kind": "stitch", "x": 0, "y": 0},
+                                {"kind": "stitch", "x": 1, "y": 0},
+                            ],
+                        },
+                    }],
+                },
+            }
+            save_training_experiment(payload, output)
+            phase = (
+                output / session["session_id"] / "experiments"
+                / "tatami_density"
+            )
+            original = (phase / "experiment.json").read_bytes()
+            payload["experiment"]["candidates"] = [
+                payload["experiment"]["candidates"][0],
+                {"candidate_id": "invalid/candidate", "plan": {}},
+            ]
+            with self.assertRaisesRegex(ValueError, "identifier"):
+                save_training_experiment(payload, output)
+            self.assertEqual(
+                original, (phase / "experiment.json").read_bytes()
+            )
+            self.assertFalse(any(
+                item.name.endswith(".tmp")
+                for item in phase.parent.iterdir()
+            ))
+
+    def test_training_bundle_rejects_stage_output_modified_after_completion(self):
+        data_url = self._training_source_data_url()
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            session = create_training_session({
+                "schema_version": 1,
+                "source": {"name": "tamper.png", "data_url": data_url},
+                "settings": {"width_mm": 72, "colors": 2},
+            }, output)
+            save_training_experiment({
+                "schema_version": 1,
+                "session_id": session["session_id"],
+                "experiment": {
+                    "phase": "construction",
+                    "parameter": "tatami_density",
+                    "candidates": [{
+                        "candidate_id": "tatami_density-1.0",
+                        "plan": {
+                            "operations": [
+                                {"kind": "stitch", "x": 0, "y": 0},
+                                {"kind": "stitch", "x": 1, "y": 0},
+                            ],
+                        },
+                    }],
+                },
+            }, output)
+            candidate = (
+                output / session["session_id"] / "experiments"
+                / "tatami_density" / "tatami_density-1.0"
+            )
+            (candidate / "candidate.dst").write_bytes(b"modified")
+            with self.assertRaisesRegex(
+                ValueError, "changed after completion"
+            ):
+                export_training_session(session["session_id"], output)
 
     def test_training_bundle_deduplicates_effective_outputs_and_checksums(self):
         data_url = self._training_source_data_url()

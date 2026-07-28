@@ -90,7 +90,7 @@ SCHEMAS = {
         "required": [
             "schema_version", "candidate_id", "effective_candidate_id",
             "parent_state_id", "action_hash", "plan_hash", "output_hash",
-            "status", "learning_weight",
+            "status", "learning_weight", "pipeline_path",
         ],
     },
     "metrics.schema.json": {
@@ -229,6 +229,25 @@ SCHEMAS = {
         "required": [
             "schema_version", "candidate_id", "artifacts",
         ],
+    },
+    "pipeline.schema.json": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "new-hat://training-bundle/pipeline/2.0.0",
+        "type": "object",
+        "required": [
+            "schema_version", "candidate_id", "pipeline_version",
+            "status", "stage_ledger_status", "stages",
+        ],
+        "properties": {
+            "schema_version": {"const": BUNDLE_SCHEMA_VERSION},
+            "candidate_id": {"type": "string"},
+            "pipeline_version": {"type": "string"},
+            "status": {"enum": ["complete", "incomplete"]},
+            "stage_ledger_status": {
+                "enum": ["verified", "synthesized_legacy"],
+            },
+            "stages": {"type": "array", "minItems": 1},
+        },
     },
 }
 
@@ -498,6 +517,216 @@ class BundleFiles:
             "content_encoding": content_encoding,
             "logical_name": logical_name,
         }
+
+
+def _saved_stage_ledger(candidate_root: Path) -> dict:
+    """Load and verify the pre-export ledger for one staged candidate."""
+    ledger_path = candidate_root / "stages.json"
+    if not ledger_path.exists():
+        stages = []
+        dependencies = []
+        for stage_id, filename in (
+            ("color_separation", "posterized.png"),
+            ("semantic_stitch_plan", "plan.json"),
+            ("machine_expansion", "candidate.dst"),
+            ("virtual_render", "sewout.png"),
+        ):
+            path = candidate_root / filename
+            if not path.exists():
+                continue
+            stages.append({
+                "stage_id": stage_id,
+                "order": len(stages),
+                "depends_on": list(dependencies),
+                "status": "complete",
+                "substeps": [],
+                "outputs": [{
+                    "path": filename,
+                    "sha256": digest_bytes(path.read_bytes()),
+                    "byte_length": path.stat().st_size,
+                }],
+            })
+            dependencies = [stage_id]
+        return {
+            "schema_version": 1,
+            "pipeline_version": "new-hat-staged-output/1.0.0",
+            "status": "complete",
+            "ledger_status": "synthesized_legacy",
+            "stages": stages,
+        }
+
+    ledger = _read_json(ledger_path)
+    if (
+        ledger.get("schema_version") != 1
+        or ledger.get("status") != "complete"
+        or not isinstance(ledger.get("stages"), list)
+    ):
+        raise ValueError(
+            f"Candidate stage ledger is incomplete: {candidate_root.name}"
+        )
+    seen = set()
+    for expected_order, stage in enumerate(ledger["stages"]):
+        stage_id = stage.get("stage_id")
+        if (
+            not isinstance(stage_id, str)
+            or not stage_id
+            or stage_id in seen
+            or stage.get("order") != expected_order
+            or stage.get("status") != "complete"
+        ):
+            raise ValueError(
+                f"Candidate stage ledger is invalid: {candidate_root.name}"
+            )
+        dependencies = stage.get("depends_on", [])
+        if (
+            not isinstance(dependencies, list)
+            or any(dependency not in seen for dependency in dependencies)
+        ):
+            raise ValueError(
+                f"Candidate stage dependency is invalid: {stage_id}"
+            )
+        outputs = stage.get("outputs", [])
+        if not isinstance(outputs, list) or not outputs:
+            raise ValueError(
+                f"Candidate stage has no durable output: {stage_id}"
+            )
+        for output in outputs:
+            name = output.get("path")
+            if (
+                not isinstance(name, str)
+                or Path(name).name != name
+                or not (candidate_root / name).is_file()
+            ):
+                raise ValueError(
+                    f"Candidate stage output is missing: {stage_id}/{name}"
+                )
+            content = (candidate_root / name).read_bytes()
+            if (
+                output.get("sha256") != digest_bytes(content)
+                or output.get("byte_length") != len(content)
+            ):
+                raise ValueError(
+                    f"Candidate stage output changed after completion: "
+                    f"{stage_id}/{name}"
+                )
+        seen.add(stage_id)
+    ledger["ledger_status"] = "verified"
+    return ledger
+
+
+def _pipeline_record(
+    *,
+    candidate_id: str,
+    saved_ledger: dict,
+    normalized_ref: dict,
+    artifact_refs: dict,
+    decoded_ref: dict | None,
+    status: dict,
+) -> dict:
+    """Translate staged local outputs into portable content-addressed evidence."""
+    artifact_by_filename = {
+        "posterized.png": artifact_refs.get("posterized"),
+        "plan.json": artifact_refs.get("plan"),
+        "candidate.dst": artifact_refs.get("dst"),
+        "sewout.png": artifact_refs.get("virtual_sewout"),
+    }
+    stages = [{
+        "stage_id": "source_normalization",
+        "order": 0,
+        "depends_on": [],
+        "status": "complete",
+        "contract": "normalize_source_without_overwriting_original",
+        "substeps": [
+            "decode_source",
+            "normalize_color_and_alpha",
+            "record_physical_transform",
+        ],
+        "outputs": [{"artifact_ref": normalized_ref}],
+    }]
+    stage_ids = {"source_normalization"}
+    previous = ["source_normalization"]
+    for saved in saved_ledger["stages"]:
+        output_refs = [
+            artifact_by_filename.get(output["path"])
+            for output in saved.get("outputs", [])
+        ]
+        output_refs = [
+            {"artifact_ref": output}
+            for output in output_refs if output is not None
+        ]
+        stage_id = saved["stage_id"]
+        dependencies = [
+            dependency for dependency in saved.get("depends_on", [])
+            if dependency in stage_ids
+        ] or list(previous)
+        stages.append({
+            "stage_id": stage_id,
+            "order": len(stages),
+            "depends_on": dependencies,
+            "status": "complete",
+            "contract": {
+                "color_separation":
+                    "preserve_element_identity_and_negative_space",
+                "semantic_stitch_plan":
+                    "geometry_to_family_to_effects_to_shared_criteria",
+                "machine_expansion":
+                    "apply_machine_profile_after_semantic_construction",
+                "virtual_render":
+                    "render_semantic_review_preview",
+            }.get(stage_id, stage_id),
+            "substeps": saved.get("substeps", []),
+            "outputs": output_refs,
+            "pre_export_outputs": saved.get("outputs", []),
+        })
+        stage_ids.add(stage_id)
+        previous = [stage_id]
+    if decoded_ref is not None:
+        stages.append({
+            "stage_id": "round_trip_validation",
+            "order": len(stages),
+            "depends_on": (
+                ["machine_expansion"]
+                if "machine_expansion" in stage_ids else list(previous)
+            ),
+            "status": (
+                "complete"
+                if not status.get("hard_blockers")
+                or "dst_round_trip_failed" not in status["hard_blockers"]
+                else "failed"
+            ),
+            "contract": "decode_and_compare_canonical_machine_stream",
+            "substeps": ["decode_machine_stream", "verify_round_trip"],
+            "outputs": [{"artifact_ref": decoded_ref}],
+        })
+        stage_ids.add("round_trip_validation")
+        previous = ["round_trip_validation"]
+    return {
+        "schema_version": BUNDLE_SCHEMA_VERSION,
+        "candidate_id": candidate_id,
+        "pipeline_version": "new-hat-staged-output/1.0.0",
+        "status": (
+            "incomplete"
+            if any(stage["status"] == "failed" for stage in stages)
+            else "complete"
+        ),
+        "stage_ledger_status": saved_ledger["ledger_status"],
+        "architecture": {
+            "semantic_order": [
+                "geometry",
+                "stitch_family_generator",
+                "effects_and_cleanup",
+                "shared_stitch_criteria",
+                "physical_layer_sequencing",
+            ],
+            "machine_order": [
+                "machine_profile_expansion",
+                "encoding",
+                "semantic_review_render",
+                "round_trip_decode",
+            ],
+        },
+        "stages": stages,
+    }
 
 
 def _resolved_action(parameter: str, value, parameters: dict) -> dict:
@@ -897,6 +1126,7 @@ def _validate_bundle(files: BundleFiles, manifest: dict) -> list[str]:
                 "action.json": "action.schema.json",
                 "recipe.json": "recipe.schema.json",
                 "layers.json": "layers.schema.json",
+                "pipeline.json": "pipeline.schema.json",
                 "metrics.json": "metrics.schema.json",
                 "drc.json": "drc.schema.json",
                 "artifact-refs.json": "artifact-refs.schema.json",
@@ -1068,6 +1298,45 @@ def _validate_bundle(files: BundleFiles, manifest: dict) -> list[str]:
                     findings.append(
                         f"artifact_length:{candidate['candidate_id']}"
                     )
+        pipeline_path = candidate.get("pipeline_path")
+        if pipeline_path not in files.files:
+            findings.append(
+                f"unresolved_pipeline:{candidate['candidate_id']}"
+            )
+        else:
+            pipeline = json.loads(files.files[pipeline_path])
+            if pipeline.get("candidate_id") != candidate["candidate_id"]:
+                findings.append(
+                    f"pipeline_candidate_mismatch:"
+                    f"{candidate['candidate_id']}"
+                )
+            stage_ids = set()
+            for expected_order, stage in enumerate(
+                pipeline.get("stages", [])
+            ):
+                if stage.get("order") != expected_order:
+                    findings.append(
+                        f"pipeline_stage_order:{candidate['candidate_id']}"
+                    )
+                if any(
+                    dependency not in stage_ids
+                    for dependency in stage.get("depends_on", [])
+                ):
+                    findings.append(
+                        f"pipeline_stage_dependency:"
+                        f"{candidate['candidate_id']}"
+                    )
+                stage_ids.add(stage.get("stage_id"))
+                for output in stage.get("outputs", []):
+                    artifact = output.get("artifact_ref")
+                    if (
+                        artifact
+                        and artifact.get("path") not in files.files
+                    ):
+                        findings.append(
+                            f"pipeline_artifact:"
+                            f"{candidate['candidate_id']}"
+                        )
     for path in manifest["indexes"]["reviews"]:
         review = json.loads(files.files[path])
         if review["comparison_id"] not in comparison_ids:
@@ -1394,6 +1663,7 @@ def compile_training_bundle(
     )
     proposal_paths = []
     candidate_paths = []
+    pipeline_paths = []
     comparison_paths = []
     review_paths = []
     reward_paths = []
@@ -1434,6 +1704,7 @@ def compile_training_bundle(
         for summary in experiment.get("candidates", []):
             display_name = summary["candidate_id"]
             candidate_root = session_root / summary["directory"]
+            saved_ledger = _saved_stage_ledger(candidate_root)
             params = _read_json(candidate_root / "parameters.json")
             plan = _read_json(candidate_root / "plan.json")
             dimensions = plan.get("dimensions_mm", {})
@@ -1522,6 +1793,19 @@ def compile_training_bundle(
                         media_type="application/x-dst",
                         logical_name=f"{display_name}.dst",
                     ) if dst else None
+                ),
+                "decoded_stream": (
+                    files.add_object(
+                        canonical_json(decoded),
+                        media_type=(
+                            "application/vnd.new-hat."
+                            "decoded-stitch-stream+json"
+                        ),
+                        logical_name=(
+                            f"{display_name}-decoded-stream.json"
+                        ),
+                        content_encoding="gzip",
+                    ) if decoded else None
                 ),
             }
             for filename, key, media_type in (
@@ -1650,6 +1934,14 @@ def compile_training_bundle(
                     "matches": semantic_colors == machine_colors,
                 },
             }
+            pipeline_record = _pipeline_record(
+                candidate_id=candidate_id,
+                saved_ledger=saved_ledger,
+                normalized_ref=normalized_ref,
+                artifact_refs=artifact_refs,
+                decoded_ref=artifact_refs["decoded_stream"],
+                status=status,
+            )
             recipe, layers = _recipe(
                 plan, resolved_parameters, decoded
             )
@@ -1720,6 +2012,9 @@ def compile_training_bundle(
                     "transform": "fit_within_width_and_55mm_height",
                 },
                 "learning_weight": 1.0,
+                "pipeline_path": (
+                    f"candidates/{candidate_id}/pipeline.json"
+                ),
                 "artifact_refs_path": (
                     f"candidates/{candidate_id}/artifact-refs.json"
                 ),
@@ -1730,11 +2025,15 @@ def compile_training_bundle(
                 "drc_path": f"candidates/{candidate_id}/drc.json",
             }
             candidate_dir = f"candidates/{candidate_id}"
+            pipeline_paths.append(
+                f"{candidate_dir}/pipeline.json"
+            )
             for filename, value in (
                 ("candidate.json", candidate_record),
                 ("action.json", action_record),
                 ("recipe.json", recipe),
                 ("layers.json", layers),
+                ("pipeline.json", pipeline_record),
                 ("metrics.json", metrics_record),
                 ("drc.json", drc_record),
                 ("artifact-refs.json", {
@@ -2144,6 +2443,12 @@ def compile_training_bundle(
     ]
     if any(item["completion_state"] != "complete" for item in review_records):
         training_ready_reasons.append("incomplete_review")
+    if any(
+        json.loads(files.files[path]).get("stage_ledger_status")
+        != "verified"
+        for path in pipeline_paths
+    ):
+        training_ready_reasons.append("stage_ledger_not_verified")
     if not files.files.get("physical-runs/index.json"):
         training_ready_reasons.append("physical_validation_missing")
     training_ready_reasons.append("final_composed_candidate_not_evaluated")
@@ -2180,6 +2485,7 @@ def compile_training_bundle(
             "states": state_paths,
             "proposals": proposal_paths,
             "candidates": candidate_paths,
+            "pipelines": pipeline_paths,
             "effective_candidates": effective_paths,
             "comparisons": comparison_paths,
             "reviews": review_paths,
@@ -2193,6 +2499,12 @@ def compile_training_bundle(
         "summary": {
             "proposals": len(proposal_paths),
             "candidates": len(candidate_paths),
+            "verified_stage_ledgers": sum(
+                json.loads(files.files[path]).get(
+                    "stage_ledger_status"
+                ) == "verified"
+                for path in pipeline_paths
+            ),
             "effective_candidates": len(effective_paths),
             "duplicate_outputs": len(candidate_paths) - len(effective_paths),
             "reviews": len(review_paths),

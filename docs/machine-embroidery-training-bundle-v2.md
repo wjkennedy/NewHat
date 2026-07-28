@@ -85,6 +85,45 @@ The three candidate identities are:
 Proposals with the same `output_hash` remain traceable but point to one
 effective candidate. Their individual learning weights sum to one.
 
+### Staged output and commit safety
+
+Candidate generation is committed as a complete directory, not as a sequence
+of writes into the active experiment. Each candidate receives a pre-export
+`stages.json` ledger whose output byte lengths and SHA-256 values are recorded
+after these durable stages:
+
+1. color separation and boundary regularization, when a posterized artifact is
+   requested;
+2. semantic stitch planning;
+3. machine-profile expansion and encoding; and
+4. virtual rendering, when a sewout is requested.
+
+The semantic stage follows one explicit contract:
+
+```text
+geometry
+  -> stitch-family generator
+  -> ordered effects and cleanup
+  -> shared stitch criteria
+  -> physical-layer sequencing
+```
+
+Machine-profile expansion happens after semantic construction. Export verifies
+every staged byte before reading it. If a stage output changed, disappeared, or
+has an invalid dependency, export stops and leaves the session available for
+diagnosis. Replacing an existing experiment uses a staged directory and a
+rollback-safe rename, so a failed regeneration cannot erase the last complete
+phase.
+
+Portable `pipeline.json` translates the local ledger into content-addressed
+references and adds source normalization plus canonical DST decode/round-trip
+validation. The current browser sewout is explicitly labeled as a semantic
+review preview; it is not misrepresented as a render of the decoded machine
+stream. A decoded-stream renderer remains a separate future stage. Older
+sessions without a ledger may be exported as legacy
+experiment evidence, but receive `stage_ledger_not_verified` and are not
+training-ready.
+
 ### Feasibility, DRC, and status
 
 The authoritative status separates:
@@ -162,6 +201,7 @@ training-session-<session_id>/
       action.json
       recipe.json
       layers.json
+      pipeline.json
       metrics.json
       drc.json
       artifact-refs.json
@@ -187,6 +227,7 @@ is training-ready only when:
 
 - all records satisfy their included schemas;
 - indexed references and artifact hashes resolve;
+- every current candidate has a verified, ordered stage ledger;
 - generator provenance and deterministic seed are present;
 - candidates have a parent state, actual action delta, and full parameters;
 - duplicate outputs share one effective-candidate learning weight;

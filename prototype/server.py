@@ -81,6 +81,110 @@ def _write_json(path: Path, value: dict) -> None:
     temporary.replace(path)
 
 
+def _artifact_digest(path: Path) -> dict:
+    content = path.read_bytes()
+    return {
+        "path": path.name,
+        "sha256": hashlib.sha256(content).hexdigest(),
+        "byte_length": len(content),
+    }
+
+
+def _write_candidate_stage_ledger(
+    candidate_root: Path,
+    *,
+    posterized: bool,
+    dst: bool,
+    sewout: bool,
+) -> None:
+    """Record the durable outputs of each completed candidate stage."""
+    stages = []
+
+    def add(stage_id: str, depends_on: list[str], outputs: list[str],
+            substeps: list[str]) -> None:
+        stages.append({
+            "stage_id": stage_id,
+            "order": len(stages),
+            "depends_on": depends_on,
+            "status": "complete",
+            "substeps": substeps,
+            "outputs": [
+                _artifact_digest(candidate_root / output)
+                for output in outputs
+            ],
+        })
+
+    previous = []
+    if posterized:
+        add(
+            "color_separation",
+            previous,
+            ["posterized.png"],
+            [
+                "normalize_source",
+                "remove_background",
+                "separate_palette",
+                "regularize_boundaries",
+            ],
+        )
+        previous = ["color_separation"]
+    add(
+        "semantic_stitch_plan",
+        previous,
+        ["plan.json"],
+        [
+            "classify_geometry",
+            "generate_stitch_family",
+            "generate_object_underlay",
+            "apply_effects_and_cleanup",
+            "validate_shared_stitch_criteria",
+            "sequence_physical_layers",
+        ],
+    )
+    previous = ["semantic_stitch_plan"]
+    if dst:
+        add(
+            "machine_expansion",
+            previous,
+            ["candidate.dst"],
+            [
+                "expand_machine_commands",
+                "encode_machine_stream",
+            ],
+        )
+        previous = ["machine_expansion"]
+    if sewout:
+        add(
+            "virtual_render",
+            previous,
+            ["sewout.png"],
+            ["render_semantic_review_preview"],
+        )
+    _write_json(candidate_root / "stages.json", {
+        "schema_version": 1,
+        "pipeline_version": "new-hat-staged-output/1.0.0",
+        "status": "complete",
+        "stages": stages,
+    })
+
+
+def _replace_directory_atomically(staged: Path, target: Path) -> None:
+    """Commit a fully written directory while retaining rollback on failure."""
+    backup = target.with_name(f".{target.name}.{uuid4().hex[:8]}.bak")
+    moved_existing = False
+    if target.exists():
+        target.replace(backup)
+        moved_existing = True
+    try:
+        staged.replace(target)
+    except Exception:
+        if moved_existing and backup.exists() and not target.exists():
+            backup.replace(target)
+        raise
+    if backup.exists():
+        shutil.rmtree(backup, ignore_errors=True)
+
+
 def _decode_data_url(value: str) -> tuple[str, bytes]:
     if not isinstance(value, str) or not value.startswith("data:"):
         raise ValueError("Artifact must be a data URL")
@@ -200,74 +304,91 @@ def save_training_experiment(
     if not isinstance(candidates, list) or not 1 <= len(candidates) <= 7:
         raise ValueError("A training experiment requires one to seven candidates")
 
-    experiment_root = root / "experiments" / parameter
-    if experiment_root.exists():
-        shutil.rmtree(experiment_root)
-    experiment_root.mkdir(parents=True)
+    experiments_root = root / "experiments"
+    experiments_root.mkdir(parents=True, exist_ok=True)
+    experiment_root = experiments_root / parameter
+    staged_root = experiments_root / (
+        f".{parameter}.{uuid4().hex[:8]}.tmp"
+    )
+    staged_root.mkdir()
     candidate_summaries = []
-    for candidate in candidates:
-        if not isinstance(candidate, dict):
-            raise ValueError("Training candidate must be an object")
-        candidate_id = str(candidate.get("candidate_id", ""))
-        if not SAFE_IDENTIFIER.fullmatch(candidate_id):
-            raise ValueError("Training candidate identifier is invalid")
-        plan = candidate.get("plan")
-        if not isinstance(plan, dict):
-            raise ValueError("Training candidate plan is required")
-        candidate_root = experiment_root / candidate_id
-        candidate_root.mkdir()
-        _write_json(candidate_root / "parameters.json", {
-            "candidate_id": candidate_id,
-            "value": candidate.get("value"),
-            "parameters": candidate.get("parameters", {}),
-            "action_delta": candidate.get("action_delta", {}),
-            "resolved_parameters": candidate.get(
-                "resolved_parameters", {}
+    try:
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                raise ValueError("Training candidate must be an object")
+            candidate_id = str(candidate.get("candidate_id", ""))
+            if not SAFE_IDENTIFIER.fullmatch(candidate_id):
+                raise ValueError("Training candidate identifier is invalid")
+            plan = candidate.get("plan")
+            if not isinstance(plan, dict):
+                raise ValueError("Training candidate plan is required")
+            candidate_root = staged_root / candidate_id
+            candidate_root.mkdir()
+            _write_json(candidate_root / "parameters.json", {
+                "candidate_id": candidate_id,
+                "value": candidate.get("value"),
+                "parameters": candidate.get("parameters", {}),
+                "action_delta": candidate.get("action_delta", {}),
+                "resolved_parameters": candidate.get(
+                    "resolved_parameters", {}
+                ),
+                "metrics": candidate.get("metrics", {}),
+                "generation": candidate.get("generation", {}),
+            })
+            _write_json(candidate_root / "plan.json", plan)
+            operations = plan.get("operations", [])
+            dst_name = None
+            if any(
+                operation.get("kind") == "stitch"
+                for operation in operations
+                if isinstance(operation, dict)
+            ):
+                dst_name = "candidate.dst"
+                (candidate_root / dst_name).write_bytes(as_dst(operations))
+            written_artifacts = set()
+            for field, filename in (
+                ("posterized_data_url", "posterized.png"),
+                ("sewout_data_url", "sewout.png"),
+            ):
+                value = candidate.get(field)
+                if value:
+                    _, content = _decode_data_url(value)
+                    (candidate_root / filename).write_bytes(content)
+                    written_artifacts.add(filename)
+            _write_candidate_stage_ledger(
+                candidate_root,
+                posterized="posterized.png" in written_artifacts,
+                dst=dst_name is not None,
+                sewout="sewout.png" in written_artifacts,
+            )
+            candidate_summaries.append({
+                "candidate_id": candidate_id,
+                "value": candidate.get("value"),
+                "directory": str(
+                    (experiment_root / candidate_id).relative_to(root)
+                ),
+                "dst": dst_name,
+            })
+        review = experiment.get("review")
+        experiment_manifest = {
+            "phase": phase,
+            "parameter": parameter,
+            "reference": experiment.get("reference"),
+            "parent_state_id": experiment.get("parent_state_id"),
+            "parent_resolved_parameters": experiment.get(
+                "parent_resolved_parameters", {}
             ),
-            "metrics": candidate.get("metrics", {}),
-            "generation": candidate.get("generation", {}),
-        })
-        _write_json(candidate_root / "plan.json", plan)
-        operations = plan.get("operations", [])
-        dst_name = None
-        if any(
-            operation.get("kind") == "stitch"
-            for operation in operations
-            if isinstance(operation, dict)
-        ):
-            dst_name = "candidate.dst"
-            (candidate_root / dst_name).write_bytes(as_dst(operations))
-        for field, filename in (
-            ("posterized_data_url", "posterized.png"),
-            ("sewout_data_url", "sewout.png"),
-        ):
-            value = candidate.get(field)
-            if value:
-                _, content = _decode_data_url(value)
-                (candidate_root / filename).write_bytes(content)
-        candidate_summaries.append({
-            "candidate_id": candidate_id,
-            "value": candidate.get("value"),
-            "directory": str(
-                candidate_root.relative_to(root)
-            ),
-            "dst": dst_name,
-        })
-    review = experiment.get("review")
-    experiment_manifest = {
-        "phase": phase,
-        "parameter": parameter,
-        "reference": experiment.get("reference"),
-        "parent_state_id": experiment.get("parent_state_id"),
-        "parent_resolved_parameters": experiment.get(
-            "parent_resolved_parameters", {}
-        ),
-        "random_seed": experiment.get("random_seed", 0),
-        "saved_at": datetime.now(timezone.utc).isoformat(),
-        "candidates": candidate_summaries,
-        "review": review if isinstance(review, dict) else None,
-    }
-    _write_json(experiment_root / "experiment.json", experiment_manifest)
+            "random_seed": experiment.get("random_seed", 0),
+            "saved_at": datetime.now(timezone.utc).isoformat(),
+            "candidates": candidate_summaries,
+            "review": review if isinstance(review, dict) else None,
+        }
+        _write_json(staged_root / "experiment.json", experiment_manifest)
+        _replace_directory_atomically(staged_root, experiment_root)
+    except Exception:
+        if staged_root.exists():
+            shutil.rmtree(staged_root)
+        raise
     manifest = json.loads(manifest_path.read_text())
     manifest["experiments"][parameter] = experiment_manifest
     _write_json(manifest_path, manifest)
