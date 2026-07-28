@@ -3,6 +3,10 @@ const candidateTemplate=document.querySelector('#candidateTemplate');
 const candidatesElement=document.querySelector('#candidates');
 const sourceArtwork=document.querySelector('#sourceArtwork');
 const artworkFile=document.querySelector('#artworkFile');
+const comparisonDialog=document.querySelector('#candidateComparison');
+const comparisonSource=document.querySelector('#comparisonSource');
+const comparisonSewout=document.querySelector('#comparisonSewout');
+let comparisonZoom=1;
 const state={
   handoff:null,
   base:null,
@@ -186,6 +190,41 @@ function updateSource(){
   frame.classList.add('has-art');
   document.querySelector('#sourceName').textContent=handoff.source.name||'Untitled artwork';
   document.querySelector('#sourceSize').textContent=`${Number(handoff.settings.width_mm).toFixed(0)} mm wide · ${handoff.settings.colors} color target`;
+}
+
+function setComparisonZoom(value){
+  comparisonZoom=Math.max(1,Math.min(4,Number(value)||1));
+  comparisonDialog.style.setProperty('--comparison-zoom',comparisonZoom);
+  comparisonDialog.classList.toggle('magnified',comparisonZoom>1);
+  document.querySelector('#zoomLevel').value=`${comparisonZoom.toFixed(comparisonZoom%1?1:0)}×`;
+  document.querySelector('#zoomOut').disabled=comparisonZoom<=1;
+  document.querySelector('#zoomIn').disabled=comparisonZoom>=4;
+}
+
+function setComparisonOrigin(event){
+  if(comparisonZoom<=1)return;
+  const bounds=event.currentTarget.getBoundingClientRect();
+  const x=Math.max(0,Math.min(100,(event.clientX-bounds.left)/bounds.width*100));
+  const y=Math.max(0,Math.min(100,(event.clientY-bounds.top)/bounds.height*100));
+  comparisonDialog.style.setProperty('--comparison-origin-x',`${x}%`);
+  comparisonDialog.style.setProperty('--comparison-origin-y',`${y}%`);
+}
+
+function openCandidateComparison(candidate){
+  const letter=String.fromCharCode(65+candidate.index);
+  document.querySelector('#comparisonTitle').textContent=`Candidate ${letter} · source and sewout`;
+  comparisonSource.src=state.handoff.source.data_url;
+  comparisonSewout.src=candidate.sewoutDataUrl;
+  comparisonDialog.dataset.candidateId=candidate.id;
+  comparisonDialog.style.setProperty('--comparison-origin-x','50%');
+  comparisonDialog.style.setProperty('--comparison-origin-y','50%');
+  setComparisonZoom(1);
+  if(!comparisonDialog.open)comparisonDialog.showModal();
+  document.querySelector('#closeComparison').focus();
+}
+
+function closeCandidateComparison(){
+  if(comparisonDialog.open)comparisonDialog.close();
 }
 
 function baselineParameters(){
@@ -809,6 +848,14 @@ function renderCandidate(candidate){
   fragment.querySelector('.candidate-parameter span').textContent=PARAMETERS[candidate.parameter].short;
   fragment.querySelector('.candidate-parameter b').textContent=candidate.option.label;
   const posterized=fragment.querySelector('.posterized-frame img');
+  const popout=fragment.querySelector('.candidate-popout');
+  const candidateLetter=String.fromCharCode(65+candidate.index);
+  popout.dataset.candidateId=candidate.id;
+  popout.setAttribute(
+    'aria-label',
+    `Compare source artwork and candidate ${candidateLetter} sewout`
+  );
+  popout.addEventListener('click',()=>openCandidateComparison(candidate));
   posterized.src=candidate.payload.posterization?.preview_data_url||state.handoff.source.data_url;
   if(candidate.phase==='separation'){
     fragment.querySelector('.posterized-frame>span').textContent='POSTERIZED CANDIDATE';
@@ -1373,6 +1420,27 @@ function renderReviewMode(){
 document.querySelector('#diagnosticMode').addEventListener('click',()=>{
   state.blindMode=!state.blindMode;
   renderReviewMode();
+});
+document.querySelector('#closeComparison').addEventListener(
+  'click',closeCandidateComparison
+);
+document.querySelector('#zoomOut').addEventListener(
+  'click',()=>setComparisonZoom(comparisonZoom-.5)
+);
+document.querySelector('#zoomIn').addEventListener(
+  'click',()=>setComparisonZoom(comparisonZoom+.5)
+);
+document.querySelector('#zoomReset').addEventListener(
+  'click',()=>setComparisonZoom(1)
+);
+document.querySelectorAll('.comparison-viewport').forEach(viewport=>{
+  viewport.addEventListener('pointermove',setComparisonOrigin);
+  viewport.addEventListener('dblclick',()=>{
+    setComparisonZoom(comparisonZoom===1?2:1);
+  });
+});
+comparisonDialog.addEventListener('click',event=>{
+  if(event.target===comparisonDialog)closeCandidateComparison();
 });
 document.querySelector('#saveSignal').addEventListener('click',saveSignal);
 document.querySelector('#exportSession').addEventListener('click',async()=>{

@@ -105,6 +105,7 @@ assert len(dst) > 512
         workspace = (prototype_root / "index.html").read_text()
         training = (prototype_root / "train.html").read_text().lower()
         training_script = (prototype_root / "train.js").read_text()
+        training_css = (prototype_root / "train.css").read_text()
         self.assertIn('id="trainModel"', workspace)
         self.assertIn("train model", workspace.lower())
         self.assertIn("source art", training)
@@ -116,6 +117,14 @@ assert len(dst) > 512
         self.assertIn("silhouette_fidelity", training)
         self.assertIn("bracketed sewouts", training)
         self.assertIn("training signal", training)
+        self.assertIn('id="candidatecomparison"', training)
+        self.assertIn("magnification controls", training)
+        self.assertIn("openCandidateComparison", training_script)
+        self.assertIn(
+            ".source-frame img{display:none;position:absolute;",
+            training_css,
+        )
+        self.assertIn("object-fit:contain", training_css)
         self.assertNotIn("job preflight", training)
         self.assertNotIn("needle bar", training)
         self.assertNotIn("pagehide", training_script)
