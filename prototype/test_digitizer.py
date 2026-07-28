@@ -133,6 +133,65 @@ assert len(dst) > 512
             training_script,
         )
 
+    def test_dst_preview_preserves_repeated_color_blocks_across_layers(self):
+        prototype_root = Path(__file__).resolve().parent
+        workspace = (prototype_root / "index.html").read_text()
+        self.assertLess(
+            workspace.index('src="thread_blocks.js"'),
+            workspace.index('src="app.js"'),
+        )
+        node = shutil.which("node")
+        if not node:
+            homebrew_node = Path("/opt/homebrew/opt/node@22/bin/node")
+            node = str(homebrew_node) if homebrew_node.exists() else None
+        if not node:
+            self.skipTest("Node is required for the preview thread-block test")
+        script = r"""
+require(process.argv[1]);
+const helpers = globalThis.NewHatThreadBlocks;
+const plan = {
+  palette: ["#aa0000", "#0000aa"],
+  regions: [
+    {id: "red", color: "#aa0000"},
+    {id: "blue", color: "#0000aa"},
+  ],
+  operations: [
+    {kind: "stitch", region_id: "red", role: "edge_underlay"},
+    {kind: "color"},
+    {kind: "stitch", region_id: "blue", role: "edge_underlay"},
+    {kind: "color"},
+    {kind: "stitch", region_id: "red", role: "top_fill"},
+    {kind: "color"},
+    {kind: "stitch", region_id: "blue", role: "top_fill"},
+    {kind: "color"},
+    {kind: "stitch", region_id: "red", role: "top_detail_running"},
+    {kind: "color"},
+    {kind: "stitch", region_id: "blue", role: "top_detail_running"},
+  ],
+};
+const blocks = helpers.planThreadBlocks(plan);
+if (blocks.map(block => block.paletteIndex).join(",") !== "0,1,0,1,0,1") {
+  throw new Error("Repeated layer colors were not mapped to palette colors");
+}
+const complete = helpers.selectedPlanOperations(plan, [true, true]);
+if (complete.filter(operation => operation.kind === "stitch").length !== 6) {
+  throw new Error("The complete preview dropped a construction layer");
+}
+const redOnly = helpers.selectedPlanOperations(plan, [true, false]);
+if (redOnly.filter(operation => operation.kind === "stitch").length !== 3) {
+  throw new Error("Color filtering did not retain every red construction layer");
+}
+if (redOnly.some(operation => operation.kind === "color")) {
+  throw new Error("Redundant color changes remain in a one-thread preview");
+}
+"""
+        result = subprocess.run(
+            [node, "-e", script, str(prototype_root / "thread_blocks.js")],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+
     def test_training_feedback_persists_validated_pairwise_signal(self):
         payload = {
             "schema_version": 1,
