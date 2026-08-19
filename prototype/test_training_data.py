@@ -35,6 +35,12 @@ def payload(**drc_overrides):
         "posterization": {
             "selected_planner": "raster_layered",
             "construction_mode": "tatami",
+            "smoothing_radius_px": 0.85,
+            "geometry_quality": {
+                "corners_per_100_boundary_px": 42.0,
+                "negative_space_count": 2,
+                "reference_iou": 0.97,
+            },
             "color_separation": {
                 "merge_tolerance_rgb": 8,
                 "semantic_color_count": 1,
@@ -81,6 +87,15 @@ class DrcTrainingTests(unittest.TestCase):
             "tatami",
             training_record["proposal"]["construction_mode"],
         )
+        self.assertEqual(
+            0.85,
+            training_record["proposal"]["posterization_smoothing_px"],
+        )
+        self.assertEqual(
+            2,
+            training_record["features"]["artwork_observations"]
+            ["geometry_quality"]["negative_space_count"],
+        )
 
     def test_drc_policy_distinguishes_pass_review_and_block(self):
         self.assertEqual(evaluate_drc(payload())["status"], "pass")
@@ -114,6 +129,15 @@ class DrcTrainingTests(unittest.TestCase):
             evaluation["evidence"]["long_stitch_examples"][0]["length_mm"],
             9,
         )
+
+        color_loss = payload()
+        color_loss["posterization"]["foreground_color_coverage"] = 0.72
+        evaluation = evaluate_drc(color_loss)
+        self.assertEqual(evaluation["status"], "block")
+        self.assertTrue(any(
+            finding["rule"] == "artwork.foreground_color_loss"
+            for finding in evaluation["hard_blockers"]
+        ))
 
     def test_training_records_are_group_split_and_rights_gated(self):
         first = deterministic_split("same-design-family")

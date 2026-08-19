@@ -56,8 +56,11 @@
 
       <section class="review">
         <div class="review-heading">
-          <div><p class="eyebrow">BRACKETED SEWOUTS</p><h2 id="bracketTitle">Controlled comparison</h2></div>
-          <span id="bracketSummary">Preparing candidates…</span>
+          <div><p class="eyebrow" id="bracketKind">BRACKETED SEWOUTS</p><h2 id="bracketTitle">Controlled comparison</h2></div>
+          <div class="review-heading-actions">
+            <button type="button" class="quiet diagnostic-toggle" id="diagnosticMode">Show diagnostics</button>
+            <span id="bracketSummary">Preparing candidates…</span>
+          </div>
         </div>
         <div class="candidate-grid" id="candidates" aria-live="polite"></div>
       </section>
@@ -70,11 +73,22 @@
         </div>
         <div class="signal-form">
           <fieldset>
+            <legend>Comparison disposition</legend>
+            <div class="disposition-list" id="reviewDisposition" aria-label="Comparison disposition">
+              <button type="button" data-disposition="winner">One winner</button>
+              <button type="button" data-disposition="tie">Tie</button>
+              <button type="button" data-disposition="no_acceptable_candidate">No acceptable candidate</button>
+            </div>
+          </fieldset>
+          <fieldset>
             <legend>Why is it better?</legend>
             <div class="reason-list" id="reasonList">
               <button type="button" data-reason="negative_space">Negative space</button>
+              <button type="button" data-reason="boundary_smoothness">Boundary smoothness</button>
               <button type="button" data-reason="curve_flow">Curve flow</button>
+              <button type="button" data-reason="detail_retention">Detail retention</button>
               <button type="button" data-reason="edge_quality">Clean edges</button>
+              <button type="button" data-reason="silhouette_fidelity">Silhouette fidelity</button>
               <button type="button" data-reason="coverage">Coverage</button>
               <button type="button" data-reason="color_accuracy">Color accuracy</button>
               <button type="button" data-reason="thread_economy">Thread economy</button>
@@ -102,7 +116,13 @@
       <article class="candidate">
         <div class="candidate-topline">
           <span class="candidate-letter"></span>
-          <span class="candidate-kind"></span>
+          <div class="candidate-heading-actions">
+            <span class="candidate-kind"></span>
+            <button type="button" class="candidate-popout">
+              <i aria-hidden="true"></i>
+              Compare
+            </button>
+          </div>
         </div>
         <div class="candidate-visuals">
           <div class="posterized-frame"><span>POSTERIZED ART</span><img alt="Posterized color separation for this candidate" /></div>
@@ -112,12 +132,47 @@
         <div class="candidate-parameter"><span></span><b></b></div>
         <div class="candidate-metrics"></div>
         <div class="candidate-evidence"></div>
+        <div class="candidate-scoring"></div>
         <div class="candidate-actions">
+          <button type="button" class="reviewed">Mark reviewed</button>
           <button type="button" class="positive">Use as positive</button>
           <button type="button" class="negative">Mark negative</button>
         </div>
       </article>
     </template>
+
+    <dialog class="comparison-dialog" id="candidateComparison" aria-labelledby="comparisonTitle">
+      <div class="comparison-panel">
+        <header class="comparison-header">
+          <div>
+            <p class="eyebrow">SOURCE / SEWOUT INSPECTION</p>
+            <h2 id="comparisonTitle">Candidate comparison</h2>
+          </div>
+          <button type="button" class="comparison-close" id="closeComparison" aria-label="Close comparison">×</button>
+        </header>
+        <div class="comparison-toolbar" aria-label="Magnification controls">
+          <button type="button" id="zoomOut" aria-label="Zoom out">−</button>
+          <output id="zoomLevel" aria-live="polite">1×</output>
+          <button type="button" id="zoomIn" aria-label="Zoom in">+</button>
+          <button type="button" id="zoomReset">Fit</button>
+          <span>Move over either view to inspect the same relative location.</span>
+        </div>
+        <div class="comparison-grid">
+          <figure>
+            <figcaption>SOURCE ART</figcaption>
+            <div class="comparison-viewport" data-comparison-view="source">
+              <img id="comparisonSource" alt="Original source artwork" />
+            </div>
+          </figure>
+          <figure>
+            <figcaption>CANDIDATE SEWOUT</figcaption>
+            <div class="comparison-viewport sewout" data-comparison-view="sewout">
+              <img id="comparisonSewout" alt="Virtual sewout for the selected candidate" />
+            </div>
+          </figure>
+        </div>
+      </div>
+    </dialog>
 
     <script src="train.js"></script>
   </body>

@@ -228,10 +228,12 @@ def build_training_record(
                 key: payload.get("posterization", {}).get(key)
                 for key in (
                     "method", "source_size_px", "foreground_pixels",
+                    "foreground_color_coverage",
                     "source_geometry_elements", "semantic_color_count",
                     "stroke_vector_candidate", "selected_planner",
                     "color_separation", "construction_mode",
-                    "running_passes",
+                    "running_passes", "smoothing_radius_px",
+                    "geometry_quality",
                 )
                 if key in payload.get("posterization", {})
             },
@@ -245,6 +247,12 @@ def build_training_record(
             "construction_mode": payload.get(
                 "posterization", {}
             ).get("construction_mode", "auto"),
+            "posterization_smoothing_px": payload.get(
+                "posterization", {}
+            ).get("smoothing_radius_px", 0.0),
+            "posterization_geometry_quality": payload.get(
+                "posterization", {}
+            ).get("geometry_quality", {}),
             "object_count": len(regions),
             "stitch_types": _histogram(regions, "stitch_type"),
             "physical_passes": _histogram(regions, "pass_name"),

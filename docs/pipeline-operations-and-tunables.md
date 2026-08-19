@@ -127,8 +127,10 @@ Pixels describe evidence; embroidery objects describe manufacturing intent.
 ### Operations
 
 - Use alpha geometry when transparency is meaningful.
-- Otherwise calculate an Otsu luminance threshold.
-- Inspect the image border to determine which threshold class is background.
+- For opaque multicolor art, sample the border color and remove
+  background-similar pixels while retaining distinct light artwork.
+- For opaque one-hue art, calculate an Otsu luminance threshold to suppress
+  antialias and JPEG fringe before vectorization.
 - Extract geometry without assuming that background is white or that artwork
   has a particular color.
 - Crop to the foreground bounds.
@@ -137,21 +139,27 @@ Pixels describe evidence; embroidery objects describe manufacturing intent.
 
 | Parameter | Current behavior | Exposure |
 | --- | --- | --- |
-| Geometry source | Alpha or Otsu luminance | Engine |
-| Otsu threshold | Computed per image | Returned diagnostic |
-| Background class | Inferred from border majority | Returned diagnostic |
+| Geometry source | Alpha, border color distance, or one-hue Otsu | Engine |
+| Otsu threshold | Computed for alpha and one-hue art | Returned diagnostic |
+| Background reference/tolerance | Inferred from border samples | Returned diagnostic |
 | Alpha threshold | Computed with Otsu when needed | Returned diagnostic |
 | Crop to foreground | Automatic | Returned diagnostic |
 | Foreground polarity override | Not available | Proposed guided control |
+| Posterization smoothing radius | 0 px production baseline; 0–2 px training bracket | API, training UI |
 | Mask cleanup strength | Purpose-specific and guarded | Engine |
 
 ### Outputs and checks
 
 - Foreground mask.
 - Threshold method and value.
-- Background class.
+- Background reference color and tolerance when applicable.
+- Foreground color-family coverage.
 - Foreground pixel count and bounds.
-- Proposed bracket: foreground retained-area ratio before and after cleanup.
+- Boundary-cleanup bracket: source-space Gaussian smoothing at 0, 0.50, 0.85,
+  1.25, and 2 px.
+- Boundary quality metrics: perimeter, edge-turn density, connected and small
+  component counts, retained negative-space count, source-mask intersection
+  over union, and area delta.
 - Proposed overlay: accepted foreground, uncertain boundary band, and rejected
   background.
 
@@ -160,6 +168,8 @@ Pixels describe evidence; embroidery objects describe manufacturing intent.
 ### Operations
 
 - Quantize only foreground pixels.
+- Use accent-preserving octree quantization for multicolor art and median cut
+  for one-hue shade consolidation.
 - Rank palette entries by coverage.
 - Measure whether each shade forms a real region or fragmented edge noise.
 - Merge fragmented shades belonging to the same thread family.

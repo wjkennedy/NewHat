@@ -5,7 +5,7 @@ from collections import Counter
 from math import hypot
 from typing import Any
 
-POLICY_VERSION = "new-hat-drc/1.0"
+POLICY_VERSION = "new-hat-drc/1.1"
 DEFAULT_STITCH_MEMORY_LIMIT = 650_000
 
 
@@ -122,6 +122,23 @@ def evaluate_drc(
         hard_blockers.append(_rule(
             "output.no_stitches", source="machine",
         ))
+    posterization = (
+        payload.get("posterization", {})
+        if isinstance(payload.get("posterization"), dict)
+        else {}
+    )
+    foreground_color_coverage = posterization.get(
+        "foreground_color_coverage"
+    )
+    if (
+        isinstance(foreground_color_coverage, (int, float))
+        and foreground_color_coverage < 0.98
+    ):
+        hard_blockers.append(_rule(
+            "artwork.foreground_color_loss",
+            count=max(1, round((1 - foreground_color_coverage) * 100)),
+            source="posterization",
+        ))
     if stitches > stitch_memory_limit:
         hard_blockers.append(_rule(
             "machine.stitch_memory",
@@ -228,6 +245,7 @@ def evaluate_drc(
             "findings_by_severity": dict(finding_counts),
             "brackets_by_status": dict(bracket_counts),
             "stitch_memory_exceeded": stitches > stitch_memory_limit,
+            "foreground_color_coverage": foreground_color_coverage,
             "stitch_count": stitches,
             "quality_score": drc.get("quality_score"),
             "short_stitches": short_stitches,

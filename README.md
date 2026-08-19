@@ -61,16 +61,28 @@ UI.
 ### Model-training workspace
 
 Choose **Train model** beside **Replace artwork** to review phase-specific
-color-separation, object/stackup, and stitch-construction brackets. Each
-experiment is generated once per browser session and remains available when
-switching between phases, so comparisons do not invoke the planner again.
+color-separation, boundary-cleanup, object/stackup, and stitch-construction
+brackets. Boundary-cleanup candidates enlarge the posterized result and compare
+source-space smoothing against edge-turn density, component noise, retained
+negative spaces, silhouette overlap, and the downstream sewout. Each experiment
+is generated once per browser session and remains available when switching
+between phases, so comparisons do not invoke the planner again.
 
 Completed experiments are staged as one temporary training session. **Export
-session** downloads a ZIP containing the source artwork, experiment manifests,
-candidate parameters and metrics, complete plans, DST files, posterized
-artwork, and virtual-sewout PNGs. The server deletes the staged session after
-the ZIP is built. Replacing artwork, discarding the session, or leaving the
-page also removes temporary plans and sewouts.
+session** compiles a bundle-v2 ZIP with immutable states, action deltas and full
+resolved parameters, effective-output deduplication, structured reviews,
+construction recipes, normalized metrics, authoritative DRC, DST round-trip
+evidence, content-addressed artifacts, schemas, checksums, and a completion
+marker. The manifest states whether the result is training-ready or only
+experiment evidence. See
+[`docs/machine-embroidery-training-bundle-v2.md`](docs/machine-embroidery-training-bundle-v2.md)
+for the evidence contract.
+
+The server deletes the staged session after the ZIP is delivered successfully
+and preserves it when delivery is interrupted so the export can be retried.
+Replacing artwork or explicitly discarding the session also removes temporary
+plans and sewouts. Browser navigation does not clear an active session because
+the page may remain live in the back/forward cache.
 
 ## Digitizing API
 
@@ -87,6 +99,7 @@ All endpoints are local and accept JSON unless noted otherwise.
   "colors": 6,
   "profile": "structured_cap",
   "density_multiplier": 1.0,
+  "posterization_smoothing_px": 0.85,
   "limits": {
     "max_objects": 400,
     "max_trims": 120,
@@ -104,6 +117,10 @@ and is clamped to `0.6`–`1.5`. It changes visible blocking density without
 removing source geometry. `limits` optionally overrides object, structural
 trim, detail-trim, and jump ceilings. Absolute and per-1,000-stitch limits are
 both applied; the lower resolved value is reported by DRC.
+`posterization_smoothing_px` is optional, defaults to `0`, and is clamped to
+`0`–`3`. It smooths the geometry-analysis raster before foreground extraction
+and vectorization while preserving the unsmoothed source for the independent
+detail scan.
 
 The response contains a semantic plan:
 
@@ -162,11 +179,14 @@ each element's area, estimated width, bounding dimensions, aspect ratio,
 geometric edge count, color complexity/entropy, image-edge count/density, pass
 eligibility, filter names, and output pixel counts.
 
-Foreground extraction is independent of thread color. Transparent images use
-an Otsu threshold over alpha. Opaque images use Otsu luminance thresholding and
-the border class as background. Palette reduction then assigns thread colors
-only inside that foreground. Geometry elements keep stable IDs when they are
-subdivided into color layers.
+Foreground extraction is independent of requested thread colors. Transparent
+images use an Otsu threshold over alpha. Opaque multicolor images sample the
+border and remove only background-similar pixels, preserving bright authored
+white, cream, yellow, and light-blue elements. One-hue marks use a tighter
+Otsu silhouette to suppress JPEG fringe. Accent-preserving palette reduction
+is used for multicolor work; median-cut shades remain available for one-hue
+consolidation. Geometry elements keep stable IDs when they are subdivided into
+color layers.
 
 Available profiles:
 

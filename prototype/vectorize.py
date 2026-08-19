@@ -5,7 +5,7 @@ from collections import Counter
 from io import BytesIO
 from math import hypot
 
-from PIL import Image
+from PIL import Image, ImageFilter
 
 from digitizer import _components, _contours, _satin_rails, _simplify_loop
 from posterize import otsu_foreground_mask, quantize_foreground
@@ -548,7 +548,12 @@ def _script_objects(
     return objects
 
 
-def vectorize_posterized(image_bytes: bytes, *, width_mm: float = 72.0) -> VectorDocument:
+def vectorize_posterized(
+    image_bytes: bytes,
+    *,
+    width_mm: float = 72.0,
+    smoothing_radius_px: float = 0.0,
+) -> VectorDocument:
     """Vectorize an already background-removed raster without colour grouping.
 
     Alpha is the foreground contract: all non-transparent pixels participate in
@@ -556,6 +561,9 @@ def vectorize_posterized(image_bytes: bytes, *, width_mm: float = 72.0) -> Vecto
     deliberately avoids treating palette entries as separate geometry.
     """
     image = Image.open(BytesIO(image_bytes)).convert("RGBA")
+    smoothing_radius_px = max(0.0, min(3.0, float(smoothing_radius_px)))
+    if smoothing_radius_px > 0:
+        image = image.filter(ImageFilter.GaussianBlur(smoothing_radius_px))
     mask, _ = otsu_foreground_mask(image)
     if not mask:
         return VectorDocument(width_mm, 0.0, [])

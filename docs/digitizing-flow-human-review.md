@@ -149,28 +149,31 @@ transforms are not baked into the image or passed as planning parameters.
 Foreground geometry is chosen independently from palette color:
 
 - If meaningful transparency exists, Otsu thresholding is applied to alpha.
-- If the image is opaque, Otsu thresholding is applied to luminance. The
-  majority border class is assumed to be background.
+- If opaque artwork contains multiple significant hue families, the border
+  supplies an adaptive background reference. Background-similar pixels are
+  removed while distinct white/cream, yellow, and light-color objects remain.
+- If opaque artwork has one significant hue family, Otsu luminance supplies a
+  tighter silhouette that avoids manufacturing objects from JPEG fringe.
 - A uniform opaque image is treated entirely as foreground.
 
-This is a binary foreground decision. There is no semantic background-removal
-model, matting, edge-confidence map, hole repair, morphological cleanup, or
-user-approved mask.
+This remains a deterministic foreground decision. There is no learned matting,
+edge-confidence map, or user-approved mask.
 
 This stage can fail when:
 
 - artwork touches the image border;
 - the background is textured or shaded;
 - foreground and background overlap in luminance;
-- a light and a dark object both need to survive;
 - antialiasing creates weak edge pixels; or
 - negative space should be interpreted from design structure.
 
 ### 3. Palette assignment
 
-Only foreground pixels participate in median-cut color quantization. The user
-requests between 2 and 15 colors. Quantization assigns each foreground pixel
-to a retained RGB palette entry.
+Only foreground pixels participate in color quantization. The user requests
+between 2 and 15 colors. Multicolor art uses an accent-preserving octree so
+small, distinct thread families are not displaced by a dominant field.
+One-hue art uses median cut so antialiased shades can be bracketed and
+consolidated into a physical thread.
 
 Color is an attribute after foreground extraction, but it still controls
 subdivision: each connected foreground element is split into connected

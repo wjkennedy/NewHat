@@ -1,11 +1,12 @@
 import unittest
 from pathlib import Path
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter
 
 from posterize import (
     analyze_pass_filters,
     detail_foreground_mask,
+    mask_geometry_metrics,
     otsu_foreground_mask,
     otsu_threshold,
     quantize_foreground,
@@ -24,7 +25,55 @@ class PosterizeTest(unittest.TestCase):
         mask, report = otsu_foreground_mask(image)
         self.assertIn((20, 15), mask)
         self.assertNotIn((0, 0), mask)
-        self.assertEqual("otsu_luminance", report["method"])
+        self.assertEqual("otsu_luminance_single_hue", report["method"])
+
+    def test_opaque_white_canvas_retains_bright_authored_colors(self):
+        image = Image.new("RGB", (100, 70), (253, 253, 253))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((10, 10, 90, 60), fill=(1, 30, 64))
+        draw.rectangle((20, 20, 42, 35), fill=(249, 241, 231))
+        draw.rectangle((58, 20, 80, 35), fill=(248, 164, 42))
+        draw.rectangle((35, 44, 65, 55), fill=(92, 157, 225))
+        mask, report = otsu_foreground_mask(image)
+        self.assertNotIn((0, 0), mask)
+        self.assertIn((20, 20), mask)
+        self.assertIn((65, 25), mask)
+        self.assertIn((50, 50), mask)
+        self.assertEqual(1.0, report["foreground_color_coverage"])
+
+    def test_background_colored_counter_remains_negative_space(self):
+        image = Image.new("RGB", (70, 50), (253, 253, 253))
+        draw = ImageDraw.Draw(image)
+        draw.ellipse((8, 5, 62, 45), fill=(184, 20, 56))
+        draw.ellipse((24, 16, 46, 35), fill=(253, 253, 253))
+        mask, _ = otsu_foreground_mask(image)
+        self.assertIn((12, 25), mask)
+        self.assertNotIn((35, 25), mask)
+
+    def test_geometry_metrics_expose_smoothing_without_hiding_counter_loss(self):
+        image = Image.new("RGB", (100, 70), "white")
+        draw = ImageDraw.Draw(image)
+        draw.ellipse((12, 8, 88, 62), fill="#b81438")
+        draw.ellipse((35, 24, 65, 46), fill="white")
+        for x in range(20, 81, 2):
+            draw.point((x, 7 - x % 2), fill="#b81438")
+        raw, _ = otsu_foreground_mask(image)
+        smoothed, _ = otsu_foreground_mask(
+            image.filter(ImageFilter.GaussianBlur(1.25))
+        )
+        raw_metrics = mask_geometry_metrics(raw)
+        smooth_metrics = mask_geometry_metrics(
+            smoothed,
+            reference=raw,
+        )
+        self.assertGreater(raw_metrics["small_component_count"], 0)
+        self.assertEqual(0, smooth_metrics["small_component_count"])
+        self.assertLess(
+            smooth_metrics["corners_per_100_boundary_px"],
+            raw_metrics["corners_per_100_boundary_px"],
+        )
+        self.assertEqual(1, smooth_metrics["negative_space_count"])
+        self.assertGreater(smooth_metrics["reference_iou"], 0.98)
 
     def test_transparency_is_the_geometry_contract(self):
         image = Image.new("RGBA", (30, 20), (245, 245, 245, 0))
